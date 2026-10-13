@@ -343,10 +343,10 @@ static DWORD WINAPI TelemetryThread(LPVOID) {
     return 0;
 }
 
-static void InstallScreenReaderPatch();   // defined below
+static void InstallScreenReaderPatch(const char* phase);   // defined below
 
 static BOOL CALLBACK StartThread(PINIT_ONCE, PVOID, PVOID*) {
-    InstallScreenReaderPatch();
+    InstallScreenReaderPatch("first XInput call");
     HANDLE h = CreateThread(nullptr, 0, TelemetryThread, nullptr, 0, nullptr);
     if (h) { CloseHandle(h); Log("telemetry thread started"); }
     else   { Log("CreateThread failed"); }
@@ -381,12 +381,14 @@ static BOOL WINAPI Hook_SPIA(UINT a, UINT b, PVOID c, UINT d) {
     return r;
 }
 
-static bool PatchImport(HMODULE mod, const char* dll, const char* func, void* hook, void** origOut) {
+// Patches the exe's import slot only if it already holds the real function address
+// (i.e. the loader has finished filling it in). Returns true when hooked.
+static bool PatchImport(HMODULE mod, const char* dll, const char* func, void* expected, void* hook) {
     BYTE* base = (BYTE*)mod;
     auto dos = (IMAGE_DOS_HEADER*)base;
     auto nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (!dir.VirtualAddress) return false;
+    if (!dir.VirtualAddress || !expected) return false;
     for (auto imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + dir.VirtualAddress); imp->Name; ++imp) {
         if (_stricmp((const char*)(base + imp->Name), dll) != 0) continue;
         auto thunk = (IMAGE_THUNK_DATA*)(base + imp->FirstThunk);
@@ -395,9 +397,9 @@ static bool PatchImport(HMODULE mod, const char* dll, const char* func, void* ho
             if (IMAGE_SNAP_BY_ORDINAL(look->u1.Ordinal)) continue;
             auto byName = (IMAGE_IMPORT_BY_NAME*)(base + look->u1.AddressOfData);
             if (strcmp((const char*)byName->Name, func) != 0) continue;
+            if ((void*)thunk->u1.Function != expected) return false;   // not resolved yet (or already hooked)
             DWORD old;
             if (!VirtualProtect(&thunk->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) return false;
-            *origOut = (void*)thunk->u1.Function;
             thunk->u1.Function = (ULONG_PTR)hook;
             VirtualProtect(&thunk->u1.Function, sizeof(void*), old, &old);
             return true;
@@ -406,12 +408,27 @@ static bool PatchImport(HMODULE mod, const char* dll, const char* func, void* ho
     return false;
 }
 
-static void InstallScreenReaderPatch() {
+static void InstallScreenReaderPatch(const char* phase) {
+    static bool doneW = false, doneA = false;
+    if (doneW && doneA) return;
     HMODULE exe = GetModuleHandleW(nullptr);
-    bool w = PatchImport(exe, "user32.dll", "SystemParametersInfoW", (void*)Hook_SPIW, (void**)&real_SPIW);
-    bool a = PatchImport(exe, "user32.dll", "SystemParametersInfoA", (void*)Hook_SPIA, (void**)&real_SPIA);
-    Log("screen reader patch: SystemParametersInfoW %s, SystemParametersInfoA %s",
-        w ? "hooked" : "not imported by exe", a ? "hooked" : "not imported by exe");
+    HMODULE u32 = GetModuleHandleW(L"user32.dll");
+    if (!exe || !u32) { Log("screen reader patch (%s): user32 not loaded yet", phase); return; }
+    if (!doneW) {
+        void* addr = (void*)GetProcAddress(u32, "SystemParametersInfoW");
+        if (PatchImport(exe, "user32.dll", "SystemParametersInfoW", addr, (void*)Hook_SPIW)) {
+            real_SPIW = (SPIW_t)addr; doneW = true;
+            Log("screen reader patch (%s): SystemParametersInfoW hooked", phase);
+        }
+    }
+    if (!doneA) {
+        void* addr = (void*)GetProcAddress(u32, "SystemParametersInfoA");
+        if (PatchImport(exe, "user32.dll", "SystemParametersInfoA", addr, (void*)Hook_SPIA)) {
+            real_SPIA = (SPIA_t)addr; doneA = true;
+            Log("screen reader patch (%s): SystemParametersInfoA hooked", phase);
+        }
+    }
+    if (!doneW && !doneA) Log("screen reader patch (%s): nothing hooked yet", phase);
 }
 
 static DWORD Capture(DWORD r, DWORD i, XINPUT_STATE* s) {
@@ -504,7 +521,8 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID) {
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         char exeA[MAX_PATH];
         WideCharToMultiByte(CP_UTF8, 0, exe, -1, exeA, MAX_PATH, nullptr, nullptr);
-        Log("=== BUILD v8 (screen reader patch) === attached to: %s", exeA);
+        Log("=== BUILD v9 (early screen reader patch) === attached to: %s", exeA);
+        InstallScreenReaderPatch("DLL load");
     }
     return TRUE;
 }
