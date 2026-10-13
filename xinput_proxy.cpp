@@ -97,18 +97,18 @@ static void DriveTriggers(DWORD index, const XINPUT_VIBRATION& v) {
 
 extern "C" {
 
-DWORD WINAPI XInputGetState(DWORD i, XINPUT_STATE* s) {
+DWORD WINAPI Proxy_XInputGetState(DWORD i, XINPUT_STATE* s) {
     EnsureReal();
     return r_GetState ? r_GetState(i, s) : ERROR_DEVICE_NOT_CONNECTED;
 }
 
-DWORD WINAPI XInputGetStateExImpl(DWORD i, XINPUT_STATE* s) {
+DWORD WINAPI Proxy_XInputGetStateEx(DWORD i, XINPUT_STATE* s) {
     EnsureReal();
     if (r_GetStateEx) return r_GetStateEx(i, s);
     return r_GetState ? r_GetState(i, s) : ERROR_DEVICE_NOT_CONNECTED;
 }
 
-DWORD WINAPI XInputSetState(DWORD i, XINPUT_VIBRATION* v) {
+DWORD WINAPI Proxy_XInputSetState(DWORD i, XINPUT_VIBRATION* v) {
     EnsureReal();
     DWORD res = r_SetState ? r_SetState(i, v) : ERROR_DEVICE_NOT_CONNECTED;
     if (v) {
@@ -119,27 +119,27 @@ DWORD WINAPI XInputSetState(DWORD i, XINPUT_VIBRATION* v) {
     return res;
 }
 
-DWORD WINAPI XInputGetCapabilities(DWORD i, DWORD f, XINPUT_CAPABILITIES* c) {
+DWORD WINAPI Proxy_XInputGetCapabilities(DWORD i, DWORD f, XINPUT_CAPABILITIES* c) {
     EnsureReal();
     return r_GetCaps ? r_GetCaps(i, f, c) : ERROR_DEVICE_NOT_CONNECTED;
 }
 
-void WINAPI XInputEnable(BOOL e) {
+void WINAPI Proxy_XInputEnable(BOOL e) {
     EnsureReal();
     if (r_Enable) r_Enable(e);
 }
 
-DWORD WINAPI XInputGetBatteryInformation(DWORD i, BYTE t, XINPUT_BATTERY_INFORMATION* b) {
+DWORD WINAPI Proxy_XInputGetBatteryInformation(DWORD i, BYTE t, XINPUT_BATTERY_INFORMATION* b) {
     EnsureReal();
     return r_Battery ? r_Battery(i, t, b) : ERROR_DEVICE_NOT_CONNECTED;
 }
 
-DWORD WINAPI XInputGetKeystroke(DWORD i, DWORD r, PXINPUT_KEYSTROKE k) {
+DWORD WINAPI Proxy_XInputGetKeystroke(DWORD i, DWORD r, PXINPUT_KEYSTROKE k) {
     EnsureReal();
     return r_Keystroke ? r_Keystroke(i, r, k) : ERROR_DEVICE_NOT_CONNECTED;
 }
 
-DWORD WINAPI XInputGetAudioDeviceIds(DWORD i, LPWSTR a, UINT* ac, LPWSTR b, UINT* bc) {
+DWORD WINAPI Proxy_XInputGetAudioDeviceIds(DWORD i, LPWSTR a, UINT* ac, LPWSTR b, UINT* bc) {
     EnsureReal();
     return r_AudioIds ? r_AudioIds(i, a, ac, b, bc) : ERROR_DEVICE_NOT_CONNECTED;
 }

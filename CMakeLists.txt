@@ -5,7 +5,7 @@ project(fh4_trigger_proxy CXX)
 #   xinput1_4 (default), xinput1_3, xinput9_1_0
 set(PROXY_NAME "xinput1_4" CACHE STRING "Output DLL name (without .dll)")
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_library(proxy SHARED xinput_proxy.cpp xinput.def)
@@ -14,5 +14,5 @@ set_target_properties(proxy PROPERTIES
     PREFIX ""
     OUTPUT_NAME "${PROXY_NAME}")
 
-target_compile_definitions(proxy PRIVATE NOMINMAX)
+target_compile_definitions(proxy PRIVATE _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
 target_link_libraries(proxy PRIVATE windowsapp user32)

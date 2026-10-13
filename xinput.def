@@ -1,9 +1,9 @@
 EXPORTS
-    XInputGetState
-    XInputSetState
-    XInputGetCapabilities
-    XInputEnable
-    XInputGetBatteryInformation
-    XInputGetKeystroke
-    XInputGetAudioDeviceIds
-    XInputGetStateEx=XInputGetStateExImpl @100 NONAME
+    XInputGetState=Proxy_XInputGetState
+    XInputSetState=Proxy_XInputSetState
+    XInputGetCapabilities=Proxy_XInputGetCapabilities
+    XInputEnable=Proxy_XInputEnable
+    XInputGetBatteryInformation=Proxy_XInputGetBatteryInformation
+    XInputGetKeystroke=Proxy_XInputGetKeystroke
+    XInputGetAudioDeviceIds=Proxy_XInputGetAudioDeviceIds
+    XInputGetStateEx=Proxy_XInputGetStateEx @100 NONAME
