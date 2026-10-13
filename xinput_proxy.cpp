@@ -8,13 +8,14 @@
 //
 //   Telemetry mode  - when FH4 "Data Out" is on (127.0.0.1:5300) the DLL reads the game's
 //                     telemetry:  right trigger = wheelspin, left trigger = brake lock-up.
-//   Input-only mode - with no telemetry, a generic effect from how far the triggers are pulled.
+//   Input-only mode - a generic effect from how far the triggers are pulled. Used when there is
+//                     no telemetry, and (by default) blended in alongside it.
 //
 // Every XInput call is forwarded unchanged to the real system xinput1_4.dll.
 // Settings live in fh4_trigger.ini next to this DLL and reload while the game runs.
 // Logging and the self-test are for troubleshooting and are OFF by default.
 
-#define PROXY_VERSION "1.0"
+#define PROXY_VERSION "1.1"
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -56,6 +57,7 @@ struct Config {
 
     // [InputOnly]
     bool   inputEnabled = true;
+    bool   inputWithTelemetry = true; // also apply input-only effects while telemetry is on
     double humBase = 0.15;            // throttle hum at light pull
     double humScale = 0.25;           // extra hum at full pull
     double burstStrength = 0.7;       // kick when the throttle is stabbed
@@ -88,10 +90,12 @@ static const int OFF_ACCEL      = 315;    // u8
 static const int OFF_BRAKE      = 316;    // u8
 static const int MIN_PACKET     = 323;
 
-static const ULONGLONG LOOP_MS               = 16;     // loop period / UDP receive timeout
+static const ULONGLONG LOOP_MS               = 8;      // loop period / UDP receive timeout
 static const ULONGLONG HOUSEKEEPING_MS       = 1000;   // config reload + diagnostics
 static const ULONGLONG TELEMETRY_TIMEOUT_MS  = 1000;   // no packets for this long -> input-only
 static const ULONGLONG PAD_REFRESH_MS        = 1000;   // re-read the gamepad list this often
+static const ULONGLONG STALE_INPUT_MS        = 500;    // XInput values older than this are ignored
+static const ULONGLONG TELEMETRY_HOLD_MS     = 100;    // keep the last telemetry effect between packets
 static const ULONGLONG SELFTEST_PHASE_MS     = 1000;
 static const int       LOG_RESET_GAP_SECONDS = 20;     // start a fresh log if the old one is older
 static const int       MAX_INPUT_LOG_LINES   = 200;
@@ -107,6 +111,7 @@ static volatile LONG      g_throttle = 0;        // right trigger 0..255
 static volatile LONG      g_brake = 0;           // left trigger 0..255
 static volatile LONG      g_buttons = 0;         // XInput button bitmask
 static volatile LONG      g_testRequested = 0;
+static volatile ULONGLONG g_lastPoll = 0;        // tick of the game's last successful XInputGetState
 static volatile ULONGLONG g_lastTelemetry = 0;   // tick of the last telemetry packet
 static LONG               g_activeSlot = -1;     // first XInput slot that reported a controller
 
@@ -183,6 +188,7 @@ static const char* DEFAULT_INI =
 "; Used automatically when no telemetry arrives\r\n"
 "[InputOnly]\r\n"
 "enabled=1\r\n"
+"with_telemetry=1   ; 1 also applies these effects while Data Out is on (0 = slip effects only)\r\n"
 "hum_base=0.15        ; throttle hum at light pull\r\n"
 "hum_scale=0.25       ; extra hum at full pull\r\n"
 "burst_strength=0.7   ; kick when you stab the throttle\r\n"
@@ -226,6 +232,7 @@ static void LoadConfig(bool first) {
     g_cfg.minSpeed         = CfgD(L"Telemetry", L"min_speed", 2.0, 0, 100);
 
     g_cfg.inputEnabled     = CfgB(L"InputOnly", L"enabled", true);
+    g_cfg.inputWithTelemetry = CfgB(L"InputOnly", L"with_telemetry", true);
     g_cfg.humBase          = CfgD(L"InputOnly", L"hum_base", 0.15, 0, 1);
     g_cfg.humScale         = CfgD(L"InputOnly", L"hum_scale", 0.25, 0, 1);
     g_cfg.burstStrength    = CfgD(L"InputOnly", L"burst_strength", 0.7, 0, 1);
@@ -308,11 +315,41 @@ static void NoteGamepadCount(unsigned cnt) {
     last = cnt;
 }
 
+// Gamepad list shared by the writer and the reader (effects thread only). It is refreshed when
+// empty, when it gets old, and after any error.
+static IVectorView<Gamepad> g_pads{ nullptr };
+static ULONGLONG g_padsTick = 0;
+
+static IVectorView<Gamepad> Pads(ULONGLONG now) {
+    if (!g_pads || g_pads.Size() == 0 || now - g_padsTick > PAD_REFRESH_MS) {
+        g_pads = Gamepad::Gamepads();
+        g_padsTick = now;
+        NoteGamepadCount((unsigned)g_pads.Size());
+    }
+    return g_pads;
+}
+
+// Reads the trigger positions straight from Windows (works because the game has focus).
+// Unlike the values passed to XInputGetState, these never go stale.
+static bool ReadWgiTriggers(ULONGLONG now, double& lt, double& rt) {
+    try {
+        bool any = false;
+        for (auto const& pad : Pads(now)) {
+            auto r = pad.GetCurrentReading();
+            lt = std::max(lt, r.LeftTrigger);
+            rt = std::max(rt, r.RightTrigger);
+            any = true;
+        }
+        return any;
+    } catch (...) {
+        g_pads = nullptr;
+        return false;
+    }
+}
+
 // Writes trigger strengths to every gamepad Windows.Gaming.Input can see (a handheld may expose
 // more than one). motors >= 0 also drives both main motors (self-test only); -1 leaves them alone.
 static void ApplyTriggers(double left, double right, double motors = -1.0) {
-    static IVectorView<Gamepad> pads{ nullptr };
-    static ULONGLONG padsTick = 0;
     static double lastL = -1, lastR = -1, lastM = -1;
     static bool loggedFail = false;
 
@@ -320,13 +357,7 @@ static void ApplyTriggers(double left, double right, double motors = -1.0) {
         return;                                   // already silent
 
     try {
-        ULONGLONG now = GetTickCount64();
-        if (!pads || pads.Size() == 0 || now - padsTick > PAD_REFRESH_MS) {
-            pads = Gamepad::Gamepads();
-            padsTick = now;
-            NoteGamepadCount((unsigned)pads.Size());
-        }
-        for (auto const& pad : pads) {
+        for (auto const& pad : Pads(GetTickCount64())) {
             GamepadVibration v{};
             try { v = pad.Vibration(); } catch (...) {}      // keep whatever the main motors are doing
             v.LeftTrigger  = std::min(g_cfg.maxStrength, left * g_cfg.leftGain);
@@ -337,7 +368,7 @@ static void ApplyTriggers(double left, double right, double motors = -1.0) {
         lastL = left; lastR = right; lastM = motors;
     } catch (...) {
         if (!loggedFail) { Log("trigger write failed"); loggedFail = true; }
-        pads = nullptr;                           // gamepad list may be stale; fetch it again next time
+        g_pads = nullptr;                         // list may be stale; fetch it again next time
     }
 }
 
@@ -372,8 +403,9 @@ static double Pulse() {
     return std::fmod(t * g_cfg.pulseHz, 1.0) < 0.5 ? 1.0 : g_cfg.pulseLow;
 }
 
-// Wheelspin (right trigger) and lock-up (left trigger) from a Data Out packet.
-static Effects TelemetryEffects(const char* buf) {
+// Wheelspin (right trigger) and lock-up (left trigger) strength from a Data Out packet.
+// The buzzing pulse is applied separately, every loop, so it carries on between packets.
+static Effects TelemetryAmplitudes(const char* buf) {
     Effects fx;
     if (Rd<int>(buf, OFF_RACE_ON) == 0) return fx;                       // paused / in a menu
 
@@ -391,17 +423,16 @@ static Effects TelemetryEffects(const char* buf) {
     double driven = (drive == 0) ? front : (drive == 1) ? rear : std::max(front, rear);
     double lock = std::max(front, rear);
 
-    if (accel > TELEMETRY_PEDAL_MIN) fx.right = driven * accel * Pulse();
-    if (brake > TELEMETRY_PEDAL_MIN) fx.left  = lock * brake * Pulse();
+    if (accel > TELEMETRY_PEDAL_MIN) fx.right = driven * accel;
+    if (brake > TELEMETRY_PEDAL_MIN) fx.left  = lock * brake;
     return fx;
 }
 
 // Generic effect from trigger pull alone (no telemetry).
 struct InputFxState { double windowStartT = 0.0; ULONGLONG windowTick = 0, burstUntil = 0; };
 
-static Effects InputOnlyEffects(InputFxState& st, ULONGLONG now) {
+static Effects InputOnlyEffects(InputFxState& st, ULONGLONG now, double t, double b) {
     Effects fx;
-    double t = g_throttle / 255.0, b = g_brake / 255.0;
 
     if (now - st.windowTick >= (ULONGLONG)g_cfg.burstWindowMs) {         // start a new comparison window
         st.windowStartT = t; st.windowTick = now;
@@ -416,6 +447,14 @@ static Effects InputOnlyEffects(InputFxState& st, ULONGLONG now) {
     if (b > g_cfg.chatterThreshold)     fx.left = g_cfg.chatterStrength * Pulse();
     else if (b > TRIGGER_DEADZONE)      fx.left = g_cfg.lightBrake * b;
     return fx;
+}
+
+// Trigger pull 0..1 from the game's own XInput polling (ignored when stale) and from Windows.
+static void ReadInputs(ULONGLONG now, double& t, double& b) {
+    t = b = 0.0;
+    if (now - g_lastPoll <= STALE_INPUT_MS) { t = g_throttle / 255.0; b = g_brake / 255.0; }
+    double wl = 0.0, wr = 0.0;
+    if (ReadWgiTriggers(now, wl, wr)) { t = std::max(t, wr); b = std::max(b, wl); }
 }
 
 // =====================================================================================
@@ -495,7 +534,9 @@ static DWORD WINAPI EffectsThread(LPVOID) {
 
     char buf[1024];
     ULONGLONG nextHousekeeping = 0, autoTestAt = 0;
-    bool autoTestDone = false, loggedPacket = false, loggedInputMode = false;
+    bool autoTestDone = false, loggedPacket = false, loggedInputMode = false, stalePolling = false;
+    Effects telemetryAmp;
+    ULONGLONG ampTick = 0;
     InputFxState inputFx;
     SelfTest test;
     InputLog inputLog;
@@ -511,6 +552,12 @@ static DWORD WINAPI EffectsThread(LPVOID) {
             if (IniChanged()) LoadConfig(false);
             if (g_cfg.log) {             // diagnostics only
                 try { NoteGamepadCount((unsigned)Gamepad::Gamepads().Size()); } catch (...) {}
+                bool stale = g_lastPoll != 0 && now - g_lastPoll > STALE_INPUT_MS;
+                if (stale != stalePolling) {
+                    stalePolling = stale;
+                    Log(stale ? "game stopped calling XInputGetState (input read another way?)"
+                              : "game is calling XInputGetState again");
+                }
             }
         }
 
@@ -521,14 +568,30 @@ static DWORD WINAPI EffectsThread(LPVOID) {
         if (g_cfg.debugInput) LogInputChanges(inputLog, now);
         if (RunSelfTest(test, now)) continue;
 
-        Effects fx;
         if (n >= MIN_PACKET) {
             g_lastTelemetry = now;
             if (!loggedPacket) { Log("first telemetry packet, %d bytes", n); loggedPacket = true; }
-            fx = TelemetryEffects(buf);
-        } else if (g_cfg.inputEnabled && now - g_lastTelemetry > TELEMETRY_TIMEOUT_MS) {
-            if (!loggedInputMode) { Log("no telemetry, using input-only mode"); loggedInputMode = true; }
-            fx = InputOnlyEffects(inputFx, now);
+            telemetryAmp = TelemetryAmplitudes(buf);
+            ampTick = now;
+        }
+        const bool telemetryLive = now - g_lastTelemetry <= TELEMETRY_TIMEOUT_MS;
+        const double pulse = Pulse();
+
+        Effects fx;                                                   // slip effects, held between packets
+        if (now - ampTick <= TELEMETRY_HOLD_MS) {
+            fx.left  = telemetryAmp.left * pulse;
+            fx.right = telemetryAmp.right * pulse;
+        }
+        if (g_cfg.inputEnabled && (!telemetryLive || g_cfg.inputWithTelemetry)) {
+            if (!loggedInputMode) {
+                Log(telemetryLive ? "input-only effects blended with telemetry" : "no telemetry, using input-only mode");
+                loggedInputMode = true;
+            }
+            double t, b;
+            ReadInputs(now, t, b);
+            Effects in = InputOnlyEffects(inputFx, now, t, b);
+            fx.left  = std::max(fx.left, in.left);
+            fx.right = std::max(fx.right, in.right);
         }
         if (!g_cfg.enabled) fx = Effects();
         ApplyTriggers(fx.left, fx.right);
@@ -553,6 +616,7 @@ static DWORD Capture(DWORD r, DWORD i, XINPUT_STATE* s) {
             g_throttle = s->Gamepad.bRightTrigger;
             g_brake    = s->Gamepad.bLeftTrigger;
             g_buttons  = s->Gamepad.wButtons;
+            g_lastPoll = GetTickCount64();
             const WORD combo = XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER | XINPUT_GAMEPAD_BACK;
             if (g_cfg.testCombo && (s->Gamepad.wButtons & combo) == combo)
                 InterlockedExchange(&g_testRequested, 1);
