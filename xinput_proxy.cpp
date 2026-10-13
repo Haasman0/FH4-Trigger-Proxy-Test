@@ -44,12 +44,21 @@ static AudioIds_t  r_AudioIds;
 static INIT_ONCE   g_once = INIT_ONCE_STATIC_INIT;
 static bool        g_winrtOk = false;
 
+static wchar_t g_logPath[MAX_PATH] = L"fh4_trigger_proxy.log";
+
 static void Log(const char* fmt, ...) {
     if (!ENABLE_LOG) return;
-    FILE* f = nullptr;
-    if (fopen_s(&f, "fh4_trigger_proxy.log", "a") != 0 || !f) return;
-    va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a);
-    fputc('\n', f); fclose(f);
+    char buf[512];
+    va_list a; va_start(a, fmt);
+    int n = vsnprintf(buf, sizeof(buf) - 2, fmt, a);
+    va_end(a);
+    if (n < 0) return;
+    buf[n++] = '\r'; buf[n++] = '\n';
+    HANDLE h = CreateFileW(g_logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w; WriteFile(h, buf, (DWORD)n, &w, nullptr);
+    CloseHandle(h);
 }
 
 static BOOL CALLBACK InitReal(PINIT_ONCE, PVOID, PVOID*) {
@@ -144,6 +153,36 @@ DWORD WINAPI Proxy_XInputGetAudioDeviceIds(DWORD i, LPWSTR a, UINT* ac, LPWSTR b
     return r_AudioIds ? r_AudioIds(i, a, ac, b, bc) : ERROR_DEVICE_NOT_CONNECTED;
 }
 
+// ---- Exports that exist in older XInput (1_3 / 9_1_0) but not in 1_4.
+// Games linked against those DLLs may import them; missing exports stop the game from starting.
+DWORD WINAPI Proxy_XInputGetDSoundAudioDeviceGuids(DWORD, GUID*, GUID*) {
+    return ERROR_DEVICE_NOT_CONNECTED;
+}
+DWORD WINAPI Proxy_Ordinal101(DWORD, DWORD) { return ERROR_CALL_NOT_IMPLEMENTED; }
+DWORD WINAPI Proxy_Ordinal102(DWORD) { return ERROR_CALL_NOT_IMPLEMENTED; }
+DWORD WINAPI Proxy_Ordinal103(DWORD) { return ERROR_CALL_NOT_IMPLEMENTED; }
+DWORD WINAPI Proxy_Ordinal104(DWORD, void*) { return ERROR_CALL_NOT_IMPLEMENTED; }
+
 } // extern "C"
 
-BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID) { return TRUE; }
+BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(mod);
+        // Put the log next to this DLL, not in whatever the working folder is
+        wchar_t path[MAX_PATH];
+        if (GetModuleFileNameW(mod, path, MAX_PATH)) {
+            wchar_t* slash = wcsrchr(path, L'\\');
+            if (slash) {
+                *(slash + 1) = 0;
+                wcscat_s(path, L"fh4_trigger_proxy.log");
+                wcscpy_s(g_logPath, path);
+            }
+        }
+        wchar_t exe[MAX_PATH];
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        char exeA[MAX_PATH];
+        WideCharToMultiByte(CP_UTF8, 0, exe, -1, exeA, MAX_PATH, nullptr, nullptr);
+        Log("DLL attached to process: %s", exeA);
+    }
+    return TRUE;
+}

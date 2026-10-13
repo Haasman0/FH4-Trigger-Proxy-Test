@@ -6,4 +6,9 @@ EXPORTS
     XInputGetBatteryInformation=Proxy_XInputGetBatteryInformation
     XInputGetKeystroke=Proxy_XInputGetKeystroke
     XInputGetAudioDeviceIds=Proxy_XInputGetAudioDeviceIds
+    XInputGetDSoundAudioDeviceGuids=Proxy_XInputGetDSoundAudioDeviceGuids
     XInputGetStateEx=Proxy_XInputGetStateEx @100 NONAME
+    Proxy_Ordinal101 @101 NONAME
+    Proxy_Ordinal102 @102 NONAME
+    Proxy_Ordinal103 @103 NONAME
+    Proxy_Ordinal104 @104 NONAME
