@@ -15,8 +15,18 @@
 // Every XInput call is forwarded unchanged to the real system xinput1_4.dll.
 // Settings live in fh4_trigger.ini next to this DLL and reload while the game runs.
 // Logging and the self-test are for troubleshooting and are OFF by default.
+// (The lite build keeps only the telemetry effects; see PROXY_VARIANT below.)
 
-#define PROXY_VERSION "1.2"
+#define PROXY_VERSION "1.3"
+
+// Build variants (compile with -DFH4_LITE for the lite build):
+//   full - telemetry effects + input-only effects (main-motor copy, trigger pull) + debug tools
+//   lite - telemetry effects only, plus logging and the automatic self-test
+#ifdef FH4_LITE
+#define PROXY_VARIANT "lite"
+#else
+#define PROXY_VARIANT "full"
+#endif
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -56,6 +66,7 @@ struct Config {
     double pulseLow = 0.35;           // strength of the quiet half of each pulse, 0..1
     double minSpeed = 2.0;            // m/s; no effects below this unless braking
 
+#ifndef FH4_LITE
     // [InputOnly]
     bool   inputEnabled = true;
     bool   inputWithTelemetry = true; // also apply input-only effects while telemetry is on
@@ -71,11 +82,16 @@ struct Config {
     double chatterThreshold = 0.85;   // brake pull where chatter starts
     double chatterStrength = 0.55;
     double lightBrake = 0.15;         // faint buzz at lighter braking
+#endif
 
     // [Debug]
+#ifndef FH4_LITE
     bool   debugInput = false;        // log button/trigger changes
+#endif
     int    autoTestSeconds = 0;       // run the self-test this long after start (0 = off)
+#ifndef FH4_LITE
     bool   testCombo = false;         // hold LB + RB + View to run the self-test
+#endif
 };
 static Config g_cfg;
 static wchar_t g_iniPath[MAX_PATH] = L"fh4_trigger.ini";
@@ -102,7 +118,7 @@ static const ULONGLONG STALE_INPUT_MS        = 500;    // XInput values older th
 static const ULONGLONG TELEMETRY_HOLD_MS     = 100;    // keep the last telemetry effect between packets
 static const ULONGLONG SELFTEST_PHASE_MS     = 1000;
 static const int       LOG_RESET_GAP_SECONDS = 20;     // start a fresh log if the old one is older
-static const int       MAX_INPUT_LOG_LINES   = 200;
+static const int       MAX_INPUT_LOG_LINES   = 1000;
 
 static const double TELEMETRY_PEDAL_MIN = 0.2;   // pedal level before slip effects apply
 static const double BRAKE_SPEED_OVERRIDE = 0.1;  // braking this much allows effects at low speed
@@ -111,16 +127,18 @@ static const double TRIGGER_DEADZONE = 0.1;      // input-only: ignore pulls bel
 // =====================================================================================
 // Shared state (written by the game's thread via XInputGetState, read by ours)
 // =====================================================================================
+static volatile LONG      g_testRequested = 0;
+static volatile ULONGLONG g_lastTelemetry = 0;   // tick of the last telemetry packet
+#ifndef FH4_LITE
 static volatile LONG      g_throttle = 0;        // right trigger 0..255
 static volatile LONG      g_brake = 0;           // left trigger 0..255
 static volatile LONG      g_buttons = 0;         // XInput button bitmask
-static volatile LONG      g_testRequested = 0;
 static volatile ULONGLONG g_lastPoll = 0;        // tick of the game's last successful XInputGetState
 static volatile LONG      g_setLeft = 0;         // motor speeds from the game's XInputSetState calls (0..65535)
 static volatile LONG      g_setRight = 0;
 static volatile ULONGLONG g_lastSet = 0;         // tick of that call
-static volatile ULONGLONG g_lastTelemetry = 0;   // tick of the last telemetry packet
 static LONG               g_activeSlot = -1;     // first XInput slot that reported a controller
+#endif
 
 // =====================================================================================
 // Logging (off unless log=1)
@@ -172,6 +190,33 @@ static void ResetLogIfStale() {
 // =====================================================================================
 // Config file
 // =====================================================================================
+#ifdef FH4_LITE
+#define INI_INPUT_SECTION ""
+#define INI_DEBUG_INPUT_LINE ""
+#define INI_DEBUG_COMBO_LINE ""
+#else
+#define INI_INPUT_SECTION \
+"; Used automatically when no telemetry arrives\r\n" \
+"[InputOnly]\r\n" \
+"enabled=1\r\n" \
+"with_telemetry=1   ; 1 also applies these effects while Data Out is on (0 = slip effects only)\r\n" \
+"mode=1             ; 0 = react to trigger pull, 1 = copy the game's main-motor rumble, 2 = both\r\n" \
+"copy_gain_left=1.0 ; mode 1/2: how strongly the left motor rumble reaches the left trigger\r\n" \
+"copy_gain_right=1.0 ; mode 1/2: how strongly the right motor rumble reaches the right trigger\r\n" \
+"hum_base=0.15        ; throttle hum at light pull\r\n" \
+"hum_scale=0.25       ; extra hum at full pull\r\n" \
+"burst_strength=0.7   ; kick when you stab the throttle\r\n" \
+"burst_threshold=0.25 ; how big the throttle jump must be\r\n" \
+"burst_window_ms=120  ; ...and how quickly it must happen\r\n" \
+"burst_ms=150         ; kick length in milliseconds\r\n" \
+"chatter_threshold=0.85 ; brake pull where chatter starts\r\n" \
+"chatter_strength=0.55\r\n" \
+"light_brake=0.15     ; faint buzz at lighter braking\r\n" \
+"\r\n"
+#define INI_DEBUG_INPUT_LINE "log_input=0          ; 1 logs button and trigger changes (needs log=1)\r\n"
+#define INI_DEBUG_COMBO_LINE "test_combo=0         ; 1 lets you run the self-test by holding LB + RB + View\r\n"
+#endif
+
 static const char* DEFAULT_INI =
 "; FH4 Trigger Proxy settings. Edits apply within about a second while the game runs\r\n"
 "; (except udp_port, which needs a restart). Values are 0..1 unless noted.\r\n"
@@ -192,28 +237,12 @@ static const char* DEFAULT_INI =
 "pulse_low=0.35       ; strength during the quiet half of each pulse (1 = steady, 0 = on/off)\r\n"
 "min_speed=2.0        ; m/s, no effects below this speed unless braking\r\n"
 "\r\n"
-"; Used automatically when no telemetry arrives\r\n"
-"[InputOnly]\r\n"
-"enabled=1\r\n"
-"with_telemetry=1   ; 1 also applies these effects while Data Out is on (0 = slip effects only)\r\n"
-"mode=1             ; 0 = react to trigger pull, 1 = copy the game's main-motor rumble, 2 = both\r\n"
-"copy_gain_left=1.0 ; mode 1/2: how strongly the left motor rumble reaches the left trigger\r\n"
-"copy_gain_right=1.0 ; mode 1/2: how strongly the right motor rumble reaches the right trigger\r\n"
-"hum_base=0.15        ; throttle hum at light pull\r\n"
-"hum_scale=0.25       ; extra hum at full pull\r\n"
-"burst_strength=0.7   ; kick when you stab the throttle\r\n"
-"burst_threshold=0.25 ; how big the throttle jump must be\r\n"
-"burst_window_ms=120  ; ...and how quickly it must happen\r\n"
-"burst_ms=150         ; kick length in milliseconds\r\n"
-"chatter_threshold=0.85 ; brake pull where chatter starts\r\n"
-"chatter_strength=0.55\r\n"
-"light_brake=0.15     ; faint buzz at lighter braking\r\n"
-"\r\n"
+INI_INPUT_SECTION
 "; Troubleshooting (all off by default)\r\n"
 "[Debug]\r\n"
-"log_input=0          ; 1 logs button and trigger changes (needs log=1)\r\n"
+INI_DEBUG_INPUT_LINE
 "auto_test_seconds=0  ; N runs a trigger self-test N seconds after the game starts (0 = off)\r\n"
-"test_combo=0         ; 1 lets you run the self-test by holding LB + RB + View\r\n";
+INI_DEBUG_COMBO_LINE;
 
 static double CfgD(const wchar_t* sec, const wchar_t* key, double def, double lo, double hi) {
     wchar_t dflt[64], buf[64];
@@ -228,6 +257,7 @@ static bool CfgB(const wchar_t* sec, const wchar_t* key, bool def) {
 }
 
 static void LoadConfig(bool first) {
+    const bool wasLogging = g_cfg.log;
     g_cfg.enabled          = CfgB(L"General", L"enabled", true);
     g_cfg.log              = CfgB(L"General", L"log", false);
     if (first) g_cfg.port  = (int)CfgD(L"General", L"udp_port", 5300, 1, 65535);
@@ -241,6 +271,7 @@ static void LoadConfig(bool first) {
     g_cfg.pulseLow         = CfgD(L"Telemetry", L"pulse_low", 0.35, 0, 1);
     g_cfg.minSpeed         = CfgD(L"Telemetry", L"min_speed", 2.0, 0, 100);
 
+#ifndef FH4_LITE
     g_cfg.inputEnabled     = CfgB(L"InputOnly", L"enabled", true);
     g_cfg.inputWithTelemetry = CfgB(L"InputOnly", L"with_telemetry", true);
     g_cfg.inputMode        = (int)CfgD(L"InputOnly", L"mode", 1, 0, 2);
@@ -255,11 +286,23 @@ static void LoadConfig(bool first) {
     g_cfg.chatterThreshold = CfgD(L"InputOnly", L"chatter_threshold", 0.85, 0, 1);
     g_cfg.chatterStrength  = CfgD(L"InputOnly", L"chatter_strength", 0.55, 0, 1);
     g_cfg.lightBrake       = CfgD(L"InputOnly", L"light_brake", 0.15, 0, 1);
+#endif
 
+#ifndef FH4_LITE
     g_cfg.debugInput       = CfgB(L"Debug", L"log_input", false);
+#endif
     g_cfg.autoTestSeconds  = (int)CfgD(L"Debug", L"auto_test_seconds", 0, 0, 3600);
+#ifndef FH4_LITE
     g_cfg.testCombo        = CfgB(L"Debug", L"test_combo", false);
+#endif
+    if (g_cfg.log && !wasLogging) Log("logging switched on: FH4 Trigger Proxy " PROXY_VERSION " (" PROXY_VARIANT ")");
+#ifdef FH4_LITE
     Log("config loaded (enabled=%d, port=%d)", g_cfg.enabled ? 1 : 0, g_cfg.port);
+#else
+    Log("config loaded (enabled=%d, port=%d, input-only: enabled=%d with_telemetry=%d mode=%d)",
+        g_cfg.enabled ? 1 : 0, g_cfg.port, g_cfg.inputEnabled ? 1 : 0,
+        g_cfg.inputWithTelemetry ? 1 : 0, g_cfg.inputMode);
+#endif
 }
 
 static void EnsureIni() {
@@ -322,6 +365,7 @@ static void EnsureReal() { InitOnceExecuteOnce(&g_realOnce, InitReal, nullptr, n
 // Trigger output (Windows.Gaming.Input)
 // =====================================================================================
 static void NoteGamepadCount(unsigned cnt) {
+    if (!g_cfg.log) return;
     static unsigned last = 0xFFFFFFFFu;
     if (cnt == last) return;
     Log("gamepads visible to Windows.Gaming.Input: %u", cnt);
@@ -342,6 +386,7 @@ static IVectorView<Gamepad> Pads(ULONGLONG now) {
     return g_pads;
 }
 
+#ifndef FH4_LITE
 // Reads the trigger positions straight from Windows (works because the game has focus).
 // Unlike the values passed to XInputGetState, these never go stale.
 static bool ReadWgiTriggers(ULONGLONG now, double& lt, double& rt) {
@@ -359,6 +404,7 @@ static bool ReadWgiTriggers(ULONGLONG now, double& lt, double& rt) {
         return false;
     }
 }
+#endif
 
 // Writes trigger strengths to every gamepad Windows.Gaming.Input can see (a handheld may expose
 // more than one). motors >= 0 also drives both main motors (self-test only); -1 leaves them alone.
@@ -380,7 +426,7 @@ static void ApplyTriggers(double left, double right, double motors = -1.0) {
         }
         lastL = left; lastR = right; lastM = motors;
     } catch (...) {
-        if (!loggedFail) { Log("trigger write failed"); loggedFail = true; }
+        if (g_cfg.log && !loggedFail) { Log("trigger write failed"); loggedFail = true; }
         g_pads = nullptr;                         // list may be stale; fetch it again next time
     }
 }
@@ -441,6 +487,7 @@ static Effects TelemetryAmplitudes(const char* buf) {
     return fx;
 }
 
+#ifndef FH4_LITE
 // Generic effect from trigger pull alone (no telemetry).
 struct InputFxState { double windowStartT = 0.0; ULONGLONG windowTick = 0, burstUntil = 0; };
 
@@ -484,6 +531,7 @@ static void ReadInputs(ULONGLONG now, double& t, double& b) {
     double wl = 0.0, wr = 0.0;
     if (ReadWgiTriggers(now, wl, wr)) { t = std::max(t, wr); b = std::max(b, wl); }
 }
+#endif
 
 // =====================================================================================
 // Troubleshooting helpers
@@ -515,16 +563,29 @@ static bool RunSelfTest(SelfTest& t, ULONGLONG now) {
     return true;
 }
 
-struct InputLog { long btn = -1, tb = -1, bb = -1; ULONGLONG last = 0; int count = 0; };
+#ifndef FH4_LITE
+struct InputLog { long btn = -1, xt = -1, xb = -1, wl = -1, wr = -1, ml = -1, mr = -1; ULONGLONG last = 0; int count = 0; };
 
+// Logs what the effects are built from, whenever any of it changes:
+//   xinput  - what the game passed through XInputGetState (and how long ago)
+//   windows - trigger positions read straight from Windows.Gaming.Input
+//   motors  - main-motor rumble the DLL can see (the source for the main-motor copy)
 static void LogInputChanges(InputLog& s, ULONGLONG now) {
     if (s.count >= MAX_INPUT_LOG_LINES) return;
-    long btn = g_buttons, tb = g_throttle / 64, bb = g_brake / 64;
-    if ((btn != s.btn || tb != s.tb || bb != s.bb) && now - s.last >= 250) {
-        s.btn = btn; s.tb = tb; s.bb = bb; s.last = now; s.count++;
-        Log("input: buttons=0x%04lX throttle=%ld brake=%ld", btn, (long)g_throttle, (long)g_brake);
-    }
+    double wl = 0.0, wr = 0.0, ml = 0.0, mr = 0.0;
+    bool havePad = ReadWgiTriggers(now, wl, wr);
+    ReadMainMotors(now, ml, mr);
+    long btn = g_buttons, xt = g_throttle / 64, xb = g_brake / 64;
+    long qwl = (long)(wl * 4), qwr = (long)(wr * 4), qml = (long)(ml * 4), qmr = (long)(mr * 4);
+    bool changed = btn != s.btn || xt != s.xt || xb != s.xb || qwl != s.wl || qwr != s.wr || qml != s.ml || qmr != s.mr;
+    if (!changed || now - s.last < 150) return;
+    s.btn = btn; s.xt = xt; s.xb = xb; s.wl = qwl; s.wr = qwr; s.ml = qml; s.mr = qmr;
+    s.last = now; s.count++;
+    long long age = g_lastPoll ? (long long)(now - g_lastPoll) : -1;
+    Log("input: xinput[age=%lldms buttons=0x%04lX throttle=%ld brake=%ld] windows[L=%.2f R=%.2f%s] motors[L=%.2f R=%.2f]",
+        age, btn, (long)g_throttle, (long)g_brake, wl, wr, havePad ? "" : " no-gamepad", ml, mr);
 }
+#endif
 
 // =====================================================================================
 // Background thread: telemetry in, trigger effects out
@@ -562,12 +623,15 @@ static DWORD WINAPI EffectsThread(LPVOID) {
 
     char buf[1024];
     ULONGLONG nextHousekeeping = 0, autoTestAt = 0;
-    bool autoTestDone = false, loggedPacket = false, loggedInputMode = false, stalePolling = false, loggedCopy = false;
+    bool autoTestDone = false, loggedPacket = false;
+#ifndef FH4_LITE
+    bool loggedInputMode = false, stalePolling = false, loggedCopy = false;
+    InputFxState inputFx;
+    InputLog inputLog;
+#endif
     Effects telemetryAmp;
     ULONGLONG ampTick = 0;
-    InputFxState inputFx;
     SelfTest test;
-    InputLog inputLog;
 
     for (;;) {
         int n = -1;
@@ -580,12 +644,14 @@ static DWORD WINAPI EffectsThread(LPVOID) {
             if (IniChanged()) LoadConfig(false);
             if (g_cfg.log) {             // diagnostics only
                 try { NoteGamepadCount((unsigned)Gamepad::Gamepads().Size()); } catch (...) {}
+#ifndef FH4_LITE
                 bool stale = g_lastPoll != 0 && now - g_lastPoll > STALE_INPUT_MS;
                 if (stale != stalePolling) {
                     stalePolling = stale;
                     Log(stale ? "game stopped calling XInputGetState (input read another way?)"
                               : "game is calling XInputGetState again");
                 }
+#endif
             }
         }
 
@@ -593,16 +659,20 @@ static DWORD WINAPI EffectsThread(LPVOID) {
             if (autoTestAt == 0) autoTestAt = now + (ULONGLONG)g_cfg.autoTestSeconds * 1000;
             else if (now >= autoTestAt) { autoTestDone = true; InterlockedExchange(&g_testRequested, 1); }
         }
+#ifndef FH4_LITE
         if (g_cfg.debugInput) LogInputChanges(inputLog, now);
+#endif
         if (RunSelfTest(test, now)) continue;
 
         if (n >= MIN_PACKET) {
             g_lastTelemetry = now;
-            if (!loggedPacket) { Log("first telemetry packet, %d bytes", n); loggedPacket = true; }
+            if (g_cfg.log && !loggedPacket) { Log("first telemetry packet, %d bytes", n); loggedPacket = true; }
             telemetryAmp = TelemetryAmplitudes(buf);
             ampTick = now;
         }
+#ifndef FH4_LITE
         const bool telemetryLive = now - g_lastTelemetry <= TELEMETRY_TIMEOUT_MS;
+#endif
         const double pulse = Pulse();
 
         Effects fx;                                                   // slip effects, held between packets
@@ -610,8 +680,9 @@ static DWORD WINAPI EffectsThread(LPVOID) {
             fx.left  = telemetryAmp.left * pulse;
             fx.right = telemetryAmp.right * pulse;
         }
+#ifndef FH4_LITE
         if (g_cfg.inputEnabled && (!telemetryLive || g_cfg.inputWithTelemetry)) {
-            if (!loggedInputMode) {
+            if (g_cfg.log && !loggedInputMode) {
                 Log(telemetryLive ? "input-only effects blended with telemetry" : "no telemetry, using input-only mode");
                 loggedInputMode = true;
             }
@@ -626,7 +697,7 @@ static DWORD WINAPI EffectsThread(LPVOID) {
                 ReadMainMotors(now, ml, mr);
                 in.left  = std::max(in.left,  ml * g_cfg.copyGainLeft);
                 in.right = std::max(in.right, mr * g_cfg.copyGainRight);
-                if (!loggedCopy && (ml > 0.0 || mr > 0.0)) {
+                if (g_cfg.log && !loggedCopy && (ml > 0.0 || mr > 0.0)) {
                     Log("copying main-motor rumble to the triggers (L=%.2f R=%.2f)", ml, mr);
                     loggedCopy = true;
                 }
@@ -634,6 +705,7 @@ static DWORD WINAPI EffectsThread(LPVOID) {
             fx.left  = std::max(fx.left, in.left);
             fx.right = std::max(fx.right, in.right);
         }
+#endif
         if (!g_cfg.enabled) fx = Effects();
         ApplyTriggers(fx.left, fx.right);
     }
@@ -649,6 +721,12 @@ static BOOL CALLBACK StartThread(PINIT_ONCE, PVOID, PVOID*) {
 
 // Records the controller state the game sees; the first call also starts our thread
 // (not from DllMain: the loader lock is held there).
+#ifdef FH4_LITE
+static DWORD Capture(DWORD r, DWORD, XINPUT_STATE*) {
+    InitOnceExecuteOnce(&g_threadOnce, StartThread, nullptr, nullptr);
+    return r;
+}
+#else
 static DWORD Capture(DWORD r, DWORD i, XINPUT_STATE* s) {
     InitOnceExecuteOnce(&g_threadOnce, StartThread, nullptr, nullptr);
     if (r == ERROR_SUCCESS && s) {
@@ -665,6 +743,7 @@ static DWORD Capture(DWORD r, DWORD i, XINPUT_STATE* s) {
     }
     return r;
 }
+#endif
 
 // =====================================================================================
 // Exported functions (names are mapped to the real XInput names by the .def file)
@@ -687,7 +766,9 @@ DWORD WINAPI Proxy_XInputGetStateEx(DWORD i, XINPUT_STATE* s) {
 DWORD WINAPI Proxy_XInputSetState(DWORD i, XINPUT_VIBRATION* v) {
     EnsureReal();
     LOG_FIRST();
+#ifndef FH4_LITE
     if (v) { g_setLeft = v->wLeftMotorSpeed; g_setRight = v->wRightMotorSpeed; g_lastSet = GetTickCount64(); }
+#endif
     return r_SetState ? r_SetState(i, v) : ERROR_DEVICE_NOT_CONNECTED;
 }
 
@@ -754,7 +835,7 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID) {
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         char exeA[MAX_PATH];
         WideCharToMultiByte(CP_UTF8, 0, exe, -1, exeA, MAX_PATH, nullptr, nullptr);
-        Log("FH4 Trigger Proxy " PROXY_VERSION " attached to: %s", exeA);
+        Log("FH4 Trigger Proxy " PROXY_VERSION " (" PROXY_VARIANT ") attached to: %s", exeA);
     }
     return TRUE;
 }

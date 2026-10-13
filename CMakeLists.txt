@@ -4,6 +4,12 @@ project(fh4_trigger_proxy CXX)
 # Name of the XInput DLL to impersonate: xinput1_4 (default), xinput1_3, xinput9_1_0
 set(PROXY_NAME "xinput1_4" CACHE STRING "Output DLL name (without .dll)")
 
+# Which build to make: "full" (telemetry + input-only effects + debug tools) or "lite" (telemetry only)
+set(FH4_VARIANT "full" CACHE STRING "full or lite")
+if(NOT FH4_VARIANT STREQUAL "full" AND NOT FH4_VARIANT STREQUAL "lite")
+  message(FATAL_ERROR "FH4_VARIANT must be 'full' or 'lite'")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -62,4 +68,7 @@ set_target_properties(proxy PROPERTIES
     OUTPUT_NAME "${PROXY_NAME}")
 
 target_compile_definitions(proxy PRIVATE _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
+if(FH4_VARIANT STREQUAL "lite")
+  target_compile_definitions(proxy PRIVATE FH4_LITE)
+endif()
 target_link_libraries(proxy PRIVATE windowsapp user32 ws2_32)
