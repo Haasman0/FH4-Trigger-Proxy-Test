@@ -45,14 +45,15 @@ struct Config {
     double rightGain = 1.0;           // throttle trigger multiplier
     // Input-only mode (used when no telemetry arrives)
     bool   inputEnabled = true;
-    double humBase = 0.08;
-    double humScale = 0.20;
+    double humBase = 0.15;
+    double humScale = 0.25;
     double burstStrength = 0.7;
     double burstThreshold = 0.25;     // throttle jump (0..1) that triggers the kick
     int    burstMs = 150;
+    int    burstWindowMs = 120;       // the throttle jump must happen within this time
     double chatterThreshold = 0.85;   // brake pull (0..1) where chatter starts
     double chatterStrength = 0.55;
-    double lightBrake = 0.10;
+    double lightBrake = 0.15;
 };
 static Config g_cfg;
 static wchar_t g_iniPath[MAX_PATH] = L"fh4_trigger.ini";
@@ -196,14 +197,15 @@ static const char* DEFAULT_INI =
 "; Used automatically when no telemetry arrives\r\n"
 "[InputOnly]\r\n"
 "enabled=1\r\n"
-"hum_base=0.08        ; throttle hum at light pull\r\n"
-"hum_scale=0.20       ; extra hum at full pull\r\n"
+"hum_base=0.15        ; throttle hum at light pull\r\n"
+"hum_scale=0.25       ; extra hum at full pull\r\n"
 "burst_strength=0.7   ; kick when you stab the throttle\r\n"
 "burst_threshold=0.25 ; how sudden the stab must be\r\n"
 "burst_ms=150         ; kick length in milliseconds\r\n"
+"burst_window_ms=120  ; the throttle jump must happen within this time\r\n"
 "chatter_threshold=0.85 ; brake pull where chatter starts\r\n"
 "chatter_strength=0.55\r\n"
-"light_brake=0.10     ; faint buzz at lighter braking\r\n";
+"light_brake=0.15     ; faint buzz at lighter braking\r\n";
 
 static double CfgD(const wchar_t* sec, const wchar_t* key, double def, double lo, double hi) {
     wchar_t dflt[64], buf[64];
@@ -232,14 +234,15 @@ static void LoadConfig(bool first) {
     g_cfg.minSpeed       = CfgD(L"Telemetry", L"min_speed", 2.0, 0, 100);
 
     g_cfg.inputEnabled   = CfgB(L"InputOnly", L"enabled", true);
-    g_cfg.humBase        = CfgD(L"InputOnly", L"hum_base", 0.08, 0, 1);
-    g_cfg.humScale       = CfgD(L"InputOnly", L"hum_scale", 0.20, 0, 1);
+    g_cfg.humBase        = CfgD(L"InputOnly", L"hum_base", 0.15, 0, 1);
+    g_cfg.humScale       = CfgD(L"InputOnly", L"hum_scale", 0.25, 0, 1);
     g_cfg.burstStrength  = CfgD(L"InputOnly", L"burst_strength", 0.7, 0, 1);
     g_cfg.burstThreshold = CfgD(L"InputOnly", L"burst_threshold", 0.25, 0.01, 1);
     g_cfg.burstMs        = (int)CfgD(L"InputOnly", L"burst_ms", 150, 10, 2000);
+    g_cfg.burstWindowMs  = (int)CfgD(L"InputOnly", L"burst_window_ms", 120, 20, 1000);
     g_cfg.chatterThreshold = CfgD(L"InputOnly", L"chatter_threshold", 0.85, 0, 1);
     g_cfg.chatterStrength  = CfgD(L"InputOnly", L"chatter_strength", 0.55, 0, 1);
-    g_cfg.lightBrake     = CfgD(L"InputOnly", L"light_brake", 0.10, 0, 1);
+    g_cfg.lightBrake     = CfgD(L"InputOnly", L"light_brake", 0.15, 0, 1);
     Log("config loaded (enabled=%d, port=%d)", g_cfg.enabled ? 1 : 0, g_cfg.port);
 }
 
@@ -315,6 +318,8 @@ static DWORD WINAPI TelemetryThread(LPVOID) {
     bool loggedFirst = false;
     char buf[1024];
     double prevT = 0.0;
+    ULONGLONG windowTick = 0;
+    bool loggedInputFx = false;
     ULONGLONG burstUntil = 0;
     bool loggedInput = false;
     ULONGLONG nextCfgCheck = 0;
@@ -352,12 +357,20 @@ static DWORD WINAPI TelemetryThread(LPVOID) {
             if (!loggedInput) { Log("no telemetry, using input-only mode"); loggedInput = true; }
             double t = g_throttle / 255.0, b = g_brake / 255.0;
             ULONGLONG now = GetTickCount64();
-            if (t - prevT > g_cfg.burstThreshold) burstUntil = now + (ULONGLONG)g_cfg.burstMs;
-            prevT = t;
+            if (now - windowTick >= (ULONGLONG)g_cfg.burstWindowMs) {        // start a new comparison window
+                prevT = t; windowTick = now;
+            } else if (t - prevT > g_cfg.burstThreshold) {                   // big rise inside the window
+                burstUntil = now + (ULONGLONG)g_cfg.burstMs;
+                prevT = t; windowTick = now;
+            }
             if (now < burstUntil)  right = g_cfg.burstStrength;
             else if (t > 0.1)      right = g_cfg.humBase + g_cfg.humScale * t;
             if (b > g_cfg.chatterThreshold) left = g_cfg.chatterStrength * Pulse();
             else if (b > 0.1)      left = g_cfg.lightBrake * b;
+            if (!loggedInputFx && (left > 0.0 || right > 0.0)) {
+                Log("input-only effect active (throttle=%ld brake=%ld)", (long)g_throttle, (long)g_brake);
+                loggedInputFx = true;
+            }
         }
         if (!g_cfg.enabled) { left = 0.0; right = 0.0; }
         ApplyTriggers(left, right);
@@ -372,10 +385,18 @@ static BOOL CALLBACK StartThread(PINIT_ONCE, PVOID, PVOID*) {
     return TRUE;
 }
 
+static LONG g_activeSlot = -1;
+
 static DWORD Capture(DWORD r, DWORD i, XINPUT_STATE* s) {
-    if (r == ERROR_SUCCESS && s && i == 0) {
-        g_throttle = s->Gamepad.bRightTrigger;
-        g_brake = s->Gamepad.bLeftTrigger;
+    if (r == ERROR_SUCCESS && s) {
+        if (g_activeSlot < 0) {
+            g_activeSlot = (LONG)i;
+            Log("XInputGetState working on slot %lu", i);
+        }
+        if ((LONG)i == g_activeSlot) {
+            g_throttle = s->Gamepad.bRightTrigger;
+            g_brake = s->Gamepad.bLeftTrigger;
+        }
     }
     return r;
 }
@@ -463,7 +484,7 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID) {
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         char exeA[MAX_PATH];
         WideCharToMultiByte(CP_UTF8, 0, exe, -1, exeA, MAX_PATH, nullptr, nullptr);
-        Log("=== BUILD v11 (screen reader patch removed) === attached to: %s", exeA);
+        Log("=== BUILD v12 (input-only fixes) === attached to: %s", exeA);
     }
     return TRUE;
 }
