@@ -8,14 +8,15 @@
 //
 //   Telemetry mode  - when FH4 "Data Out" is on (127.0.0.1:5300) the DLL reads the game's
 //                     telemetry:  right trigger = wheelspin, left trigger = brake lock-up.
-//   Input-only mode - a generic effect from how far the triggers are pulled. Used when there is
+//   Input-only mode - by default copies the game's own main-motor rumble onto the triggers (or,
+//                     optionally, reacts to how far the triggers are pulled). Used when there is
 //                     no telemetry, and (by default) blended in alongside it.
 //
 // Every XInput call is forwarded unchanged to the real system xinput1_4.dll.
 // Settings live in fh4_trigger.ini next to this DLL and reload while the game runs.
 // Logging and the self-test are for troubleshooting and are OFF by default.
 
-#define PROXY_VERSION "1.1"
+#define PROXY_VERSION "1.2"
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
@@ -58,6 +59,9 @@ struct Config {
     // [InputOnly]
     bool   inputEnabled = true;
     bool   inputWithTelemetry = true; // also apply input-only effects while telemetry is on
+    int    inputMode = 1;             // 0 = react to trigger pull, 1 = copy the game's main-motor rumble, 2 = both
+    double copyGainLeft = 1.0;        // strength of the main-motor copy, per trigger
+    double copyGainRight = 1.0;
     double humBase = 0.15;            // throttle hum at light pull
     double humScale = 0.25;           // extra hum at full pull
     double burstStrength = 0.7;       // kick when the throttle is stabbed
@@ -112,6 +116,9 @@ static volatile LONG      g_brake = 0;           // left trigger 0..255
 static volatile LONG      g_buttons = 0;         // XInput button bitmask
 static volatile LONG      g_testRequested = 0;
 static volatile ULONGLONG g_lastPoll = 0;        // tick of the game's last successful XInputGetState
+static volatile LONG      g_setLeft = 0;         // motor speeds from the game's XInputSetState calls (0..65535)
+static volatile LONG      g_setRight = 0;
+static volatile ULONGLONG g_lastSet = 0;         // tick of that call
 static volatile ULONGLONG g_lastTelemetry = 0;   // tick of the last telemetry packet
 static LONG               g_activeSlot = -1;     // first XInput slot that reported a controller
 
@@ -189,6 +196,9 @@ static const char* DEFAULT_INI =
 "[InputOnly]\r\n"
 "enabled=1\r\n"
 "with_telemetry=1   ; 1 also applies these effects while Data Out is on (0 = slip effects only)\r\n"
+"mode=1             ; 0 = react to trigger pull, 1 = copy the game's main-motor rumble, 2 = both\r\n"
+"copy_gain_left=1.0 ; mode 1/2: how strongly the left motor rumble reaches the left trigger\r\n"
+"copy_gain_right=1.0 ; mode 1/2: how strongly the right motor rumble reaches the right trigger\r\n"
 "hum_base=0.15        ; throttle hum at light pull\r\n"
 "hum_scale=0.25       ; extra hum at full pull\r\n"
 "burst_strength=0.7   ; kick when you stab the throttle\r\n"
@@ -233,6 +243,9 @@ static void LoadConfig(bool first) {
 
     g_cfg.inputEnabled     = CfgB(L"InputOnly", L"enabled", true);
     g_cfg.inputWithTelemetry = CfgB(L"InputOnly", L"with_telemetry", true);
+    g_cfg.inputMode        = (int)CfgD(L"InputOnly", L"mode", 1, 0, 2);
+    g_cfg.copyGainLeft     = CfgD(L"InputOnly", L"copy_gain_left", 1.0, 0, 5);
+    g_cfg.copyGainRight    = CfgD(L"InputOnly", L"copy_gain_right", 1.0, 0, 5);
     g_cfg.humBase          = CfgD(L"InputOnly", L"hum_base", 0.15, 0, 1);
     g_cfg.humScale         = CfgD(L"InputOnly", L"hum_scale", 0.25, 0, 1);
     g_cfg.burstStrength    = CfgD(L"InputOnly", L"burst_strength", 0.7, 0, 1);
@@ -449,6 +462,21 @@ static Effects InputOnlyEffects(InputFxState& st, ULONGLONG now, double t, doubl
     return fx;
 }
 
+// Main-motor rumble the game is asking for right now, 0..1 per motor. Taken from Windows' own
+// record of the last vibration written to the controller (which includes the game's writes), and
+// from XInputSetState if the game happens to use it.
+static void ReadMainMotors(ULONGLONG now, double& left, double& right) {
+    left = right = 0.0;
+    if (now - g_lastSet <= STALE_INPUT_MS * 2) { left = g_setLeft / 65535.0; right = g_setRight / 65535.0; }
+    try {
+        for (auto const& pad : Pads(now)) {
+            auto v = pad.Vibration();
+            left  = std::max(left, v.LeftMotor);
+            right = std::max(right, v.RightMotor);
+        }
+    } catch (...) { g_pads = nullptr; }
+}
+
 // Trigger pull 0..1 from the game's own XInput polling (ignored when stale) and from Windows.
 static void ReadInputs(ULONGLONG now, double& t, double& b) {
     t = b = 0.0;
@@ -534,7 +562,7 @@ static DWORD WINAPI EffectsThread(LPVOID) {
 
     char buf[1024];
     ULONGLONG nextHousekeeping = 0, autoTestAt = 0;
-    bool autoTestDone = false, loggedPacket = false, loggedInputMode = false, stalePolling = false;
+    bool autoTestDone = false, loggedPacket = false, loggedInputMode = false, stalePolling = false, loggedCopy = false;
     Effects telemetryAmp;
     ULONGLONG ampTick = 0;
     InputFxState inputFx;
@@ -587,9 +615,22 @@ static DWORD WINAPI EffectsThread(LPVOID) {
                 Log(telemetryLive ? "input-only effects blended with telemetry" : "no telemetry, using input-only mode");
                 loggedInputMode = true;
             }
-            double t, b;
-            ReadInputs(now, t, b);
-            Effects in = InputOnlyEffects(inputFx, now, t, b);
+            Effects in;
+            if (g_cfg.inputMode != 1) {                               // react to how far the triggers are pulled
+                double t, b;
+                ReadInputs(now, t, b);
+                in = InputOnlyEffects(inputFx, now, t, b);
+            }
+            if (g_cfg.inputMode != 0) {                               // copy the game's main-motor rumble
+                double ml, mr;
+                ReadMainMotors(now, ml, mr);
+                in.left  = std::max(in.left,  ml * g_cfg.copyGainLeft);
+                in.right = std::max(in.right, mr * g_cfg.copyGainRight);
+                if (!loggedCopy && (ml > 0.0 || mr > 0.0)) {
+                    Log("copying main-motor rumble to the triggers (L=%.2f R=%.2f)", ml, mr);
+                    loggedCopy = true;
+                }
+            }
             fx.left  = std::max(fx.left, in.left);
             fx.right = std::max(fx.right, in.right);
         }
@@ -646,6 +687,7 @@ DWORD WINAPI Proxy_XInputGetStateEx(DWORD i, XINPUT_STATE* s) {
 DWORD WINAPI Proxy_XInputSetState(DWORD i, XINPUT_VIBRATION* v) {
     EnsureReal();
     LOG_FIRST();
+    if (v) { g_setLeft = v->wLeftMotorSpeed; g_setRight = v->wRightMotorSpeed; g_lastSet = GetTickCount64(); }
     return r_SetState ? r_SetState(i, v) : ERROR_DEVICE_NOT_CONNECTED;
 }
 
