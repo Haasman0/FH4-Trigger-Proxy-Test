@@ -1,4 +1,6 @@
 # FH4 Trigger Proxy
+Disclaimer: This project is 100% vibecoded, use at your own will, I tested it and it works for the most part.
+I created it because I was bored and curious about Claude AI
 
 Adds impulse-trigger rumble to Forza Horizon 4 (Steam) on Xbox One / Series controllers and
 handhelds like the ROG Xbox Ally X.
