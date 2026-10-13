@@ -1,0 +1,26 @@
+name: Build proxy DLL
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        name: [xinput1_4, xinput1_3, xinput9_1_0]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -A x64 -DPROXY_NAME=${{ matrix.name }}
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: build/Release/${{ matrix.name }}.dll
