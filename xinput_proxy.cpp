@@ -22,18 +22,40 @@
 #include <cstdarg>
 #include <cstring>
 #include <cmath>
+#include <cwchar>
+#include <cstdlib>
 #include <algorithm>
 
 using namespace winrt::Windows::Gaming::Input;
 
-// ---- Tuning ----
-static const bool   ENABLE_LOG    = true;
-static const int    UDP_PORT      = 5300;
-static const double SLIP_START    = 0.35;  // slip ratio where the effect begins
-static const double SLIP_FULL     = 1.5;   // slip ratio for full strength
-static const double MAX_STRENGTH  = 0.9;   // cap, 0..1
-static const double PULSE_HZ      = 14.0;  // buzz rate
-static const double MIN_SPEED     = 2.0;   // m/s, ignore effects when nearly stopped
+// ---- Settings (loaded from fh4_trigger.ini next to the DLL; reloads live) ----
+struct Config {
+    bool   log = true;
+    bool   enabled = true;
+    int    port = 5300;               // restart needed to change
+    // Telemetry mode
+    double slipStart = 0.35;          // slip ratio where the effect begins
+    double slipFull = 1.5;            // slip ratio for full strength
+    double maxStrength = 0.9;         // cap, 0..1
+    double pulseHz = 14.0;            // buzz rate
+    double pulseLow = 0.35;           // strength of the "off" half of each pulse, 0..1
+    double minSpeed = 2.0;            // m/s, ignore effects when nearly stopped
+    double leftGain = 1.0;            // brake trigger multiplier
+    double rightGain = 1.0;           // throttle trigger multiplier
+    // Input-only mode (used when no telemetry arrives)
+    bool   inputEnabled = true;
+    double humBase = 0.08;
+    double humScale = 0.20;
+    double burstStrength = 0.7;
+    double burstThreshold = 0.25;     // throttle jump (0..1) that triggers the kick
+    int    burstMs = 150;
+    double chatterThreshold = 0.85;   // brake pull (0..1) where chatter starts
+    double chatterStrength = 0.55;
+    double lightBrake = 0.10;
+};
+static Config g_cfg;
+static wchar_t g_iniPath[MAX_PATH] = L"fh4_trigger.ini";
+static FILETIME g_iniTime = {};
 
 // FH4 Data Out layout (bytes)
 static const int OFF_RACE_ON   = 0;
@@ -48,7 +70,7 @@ static const int MIN_LEN       = 323;
 static wchar_t g_logPath[MAX_PATH] = L"fh4_trigger_proxy.log";
 
 static void Log(const char* fmt, ...) {
-    if (!ENABLE_LOG) return;
+    if (!g_cfg.log) return;
     char buf[512];
     va_list a; va_start(a, fmt);
     int n = vsnprintf(buf, sizeof(buf) - 2, fmt, a);
@@ -83,6 +105,9 @@ static Keystroke_t r_Keystroke;
 static AudioIds_t  r_AudioIds;
 static INIT_ONCE   g_once = INIT_ONCE_STATIC_INIT;
 static INIT_ONCE   g_threadOnce = INIT_ONCE_STATIC_INIT;
+static volatile LONG      g_throttle = 0;       // latest right trigger 0..255 seen via XInputGetState
+static volatile LONG      g_brake = 0;          // latest left trigger 0..255
+static volatile ULONGLONG g_lastTelemetry = 0;  // tick of last telemetry packet
 
 static BOOL CALLBACK InitReal(PINIT_ONCE, PVOID, PVOID*) {
     wchar_t path[MAX_PATH];
@@ -108,13 +133,101 @@ template <class T> static T Rd(const char* b, int off) { T v; memcpy(&v, b + off
 
 static double Scale(float x) {
     double a = std::fabs((double)x);
-    if (a <= SLIP_START) return 0.0;
-    return std::min(1.0, (a - SLIP_START) / (SLIP_FULL - SLIP_START));
+    if (a <= g_cfg.slipStart) return 0.0;
+    double span = std::max(0.001, g_cfg.slipFull - g_cfg.slipStart);
+    return std::min(1.0, (a - g_cfg.slipStart) / span);
 }
 
 static double Pulse() {
     double t = (double)GetTickCount64() / 1000.0;
-    return std::fmod(t * PULSE_HZ, 1.0) < 0.5 ? 1.0 : 0.35;
+    return std::fmod(t * g_cfg.pulseHz, 1.0) < 0.5 ? 1.0 : g_cfg.pulseLow;
+}
+
+// ---- Config file ----
+static const char* DEFAULT_INI =
+"; FH4 trigger rumble settings. Changes apply within about a second while the game runs\r\n"
+"; (except udp_port, which needs a restart). Values are 0..1 unless noted.\r\n"
+"\r\n"
+"[General]\r\n"
+"enabled=1            ; 0 turns all trigger effects off\r\n"
+"log=1                ; 0 stops writing fh4_trigger_proxy.log\r\n"
+"udp_port=5300        ; must match FH4 Data Out port\r\n"
+"\r\n"
+"; Wheelspin / lock-up effects (needs FH4 Data Out on)\r\n"
+"[Telemetry]\r\n"
+"slip_start=0.35      ; slip ratio where the effect begins (lower = more sensitive)\r\n"
+"slip_full=1.5        ; slip ratio for full strength\r\n"
+"max_strength=0.9     ; overall cap\r\n"
+"left_gain=1.0        ; brake trigger multiplier\r\n"
+"right_gain=1.0       ; throttle trigger multiplier\r\n"
+"pulse_hz=14          ; buzz rate\r\n"
+"pulse_low=0.35       ; strength during the quiet half of each pulse (1 = steady, 0 = on/off)\r\n"
+"min_speed=2.0        ; m/s, no effects below this speed unless braking\r\n"
+"\r\n"
+"; Used automatically when no telemetry arrives\r\n"
+"[InputOnly]\r\n"
+"enabled=1\r\n"
+"hum_base=0.08        ; throttle hum at light pull\r\n"
+"hum_scale=0.20       ; extra hum at full pull\r\n"
+"burst_strength=0.7   ; kick when you stab the throttle\r\n"
+"burst_threshold=0.25 ; how sudden the stab must be\r\n"
+"burst_ms=150         ; kick length in milliseconds\r\n"
+"chatter_threshold=0.85 ; brake pull where chatter starts\r\n"
+"chatter_strength=0.55\r\n"
+"light_brake=0.10     ; faint buzz at lighter braking\r\n";
+
+static double CfgD(const wchar_t* sec, const wchar_t* key, double def, double lo, double hi) {
+    wchar_t dflt[64], buf[64];
+    swprintf_s(dflt, L"%g", def);
+    GetPrivateProfileStringW(sec, key, dflt, buf, 64, g_iniPath);
+    double v = _wtof(buf);             // text after the number (comments) is ignored
+    if (!(v == v)) v = def;
+    return std::min(hi, std::max(lo, v));
+}
+static bool CfgB(const wchar_t* sec, const wchar_t* key, bool def) {
+    return CfgD(sec, key, def ? 1 : 0, 0, 1) >= 0.5;
+}
+
+static void LoadConfig(bool first) {
+    g_cfg.enabled        = CfgB(L"General", L"enabled", true);
+    g_cfg.log            = CfgB(L"General", L"log", true);
+    if (first) g_cfg.port = (int)CfgD(L"General", L"udp_port", 5300, 1, 65535);
+
+    g_cfg.slipStart      = CfgD(L"Telemetry", L"slip_start", 0.35, 0, 10);
+    g_cfg.slipFull       = CfgD(L"Telemetry", L"slip_full", 1.5, 0.01, 20);
+    g_cfg.maxStrength    = CfgD(L"Telemetry", L"max_strength", 0.9, 0, 1);
+    g_cfg.leftGain       = CfgD(L"Telemetry", L"left_gain", 1.0, 0, 5);
+    g_cfg.rightGain      = CfgD(L"Telemetry", L"right_gain", 1.0, 0, 5);
+    g_cfg.pulseHz        = CfgD(L"Telemetry", L"pulse_hz", 14, 0.5, 60);
+    g_cfg.pulseLow       = CfgD(L"Telemetry", L"pulse_low", 0.35, 0, 1);
+    g_cfg.minSpeed       = CfgD(L"Telemetry", L"min_speed", 2.0, 0, 100);
+
+    g_cfg.inputEnabled   = CfgB(L"InputOnly", L"enabled", true);
+    g_cfg.humBase        = CfgD(L"InputOnly", L"hum_base", 0.08, 0, 1);
+    g_cfg.humScale       = CfgD(L"InputOnly", L"hum_scale", 0.20, 0, 1);
+    g_cfg.burstStrength  = CfgD(L"InputOnly", L"burst_strength", 0.7, 0, 1);
+    g_cfg.burstThreshold = CfgD(L"InputOnly", L"burst_threshold", 0.25, 0.01, 1);
+    g_cfg.burstMs        = (int)CfgD(L"InputOnly", L"burst_ms", 150, 10, 2000);
+    g_cfg.chatterThreshold = CfgD(L"InputOnly", L"chatter_threshold", 0.85, 0, 1);
+    g_cfg.chatterStrength  = CfgD(L"InputOnly", L"chatter_strength", 0.55, 0, 1);
+    g_cfg.lightBrake     = CfgD(L"InputOnly", L"light_brake", 0.10, 0, 1);
+    Log("config loaded (enabled=%d, port=%d)", g_cfg.enabled ? 1 : 0, g_cfg.port);
+}
+
+static void EnsureIni() {
+    HANDLE h = CreateFileW(g_iniPath, GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;          // already exists, or folder not writable
+    DWORD w; WriteFile(h, DEFAULT_INI, (DWORD)strlen(DEFAULT_INI), &w, nullptr);
+    CloseHandle(h);
+    Log("wrote default fh4_trigger.ini");
+}
+
+static bool IniChanged() {
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!GetFileAttributesExW(g_iniPath, GetFileExInfoStandard, &d)) return false;
+    if (CompareFileTime(&d.ftLastWriteTime, &g_iniTime) == 0) return false;
+    g_iniTime = d.ftLastWriteTime;
+    return true;
 }
 
 static void ApplyTriggers(double left, double right) {
@@ -133,8 +246,8 @@ static void ApplyTriggers(double left, double right) {
         }
         GamepadVibration v{};
         try { v = pad.Vibration(); } catch (...) {}   // keep any main-motor values
-        v.LeftTrigger  = std::min(MAX_STRENGTH, left);
-        v.RightTrigger = std::min(MAX_STRENGTH, right);
+        v.LeftTrigger  = std::min(g_cfg.maxStrength, left * g_cfg.leftGain);
+        v.RightTrigger = std::min(g_cfg.maxStrength, right * g_cfg.rightGain);
         pad.Vibration(v);
         lastL = left; lastR = right;
         if (!loggedOk && (left > 0 || right > 0)) { Log("trigger write OK"); loggedOk = true; }
@@ -147,6 +260,10 @@ static void ApplyTriggers(double left, double right) {
 static DWORD WINAPI TelemetryThread(LPVOID) {
     try { winrt::init_apartment(winrt::apartment_type::multi_threaded); } catch (...) {}
 
+    EnsureIni();
+    IniChanged();            // remember current file time
+    LoadConfig(true);
+
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { Log("WSAStartup failed"); return 0; }
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -156,23 +273,32 @@ static DWORD WINAPI TelemetryThread(LPVOID) {
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(UDP_PORT);
+    addr.sin_port = htons((u_short)g_cfg.port);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (bind(sock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        Log("bind to 127.0.0.1:%d failed (error %d)", UDP_PORT, WSAGetLastError());
+        Log("bind to 127.0.0.1:%d failed (error %d)", g_cfg.port, WSAGetLastError());
         return 0;
     }
-    DWORD timeoutMs = 60;
+    DWORD timeoutMs = 16;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
-    Log("telemetry listening on 127.0.0.1:%d", UDP_PORT);
+    Log("telemetry listening on 127.0.0.1:%d", g_cfg.port);
 
     bool loggedFirst = false;
     char buf[1024];
+    double prevT = 0.0;
+    ULONGLONG burstUntil = 0;
+    bool loggedInput = false;
+    ULONGLONG nextCfgCheck = 0;
     for (;;) {
         int n = recv(sock, buf, sizeof(buf), 0);
+        if (GetTickCount64() >= nextCfgCheck) {
+            nextCfgCheck = GetTickCount64() + 1000;
+            if (IniChanged()) LoadConfig(false);
+        }
         double left = 0.0, right = 0.0;
 
         if (n >= MIN_LEN) {
+            g_lastTelemetry = GetTickCount64();
             if (!loggedFirst) { Log("first telemetry packet, %d bytes", n); loggedFirst = true; }
             if (Rd<int>(buf, OFF_RACE_ON) != 0) {
                 float fl = Rd<float>(buf, OFF_SLIP), fr = Rd<float>(buf, OFF_SLIP + 4);
@@ -182,7 +308,7 @@ static DWORD WINAPI TelemetryThread(LPVOID) {
                 double accel = (unsigned char)buf[OFF_ACCEL] / 255.0;
                 double brake = (unsigned char)buf[OFF_BRAKE] / 255.0;
 
-                if (speed >= MIN_SPEED || brake >= 0.1) {
+                if (speed >= g_cfg.minSpeed || brake >= 0.1) {
                     double driven;
                     if (drive == 0)      driven = std::max(Scale(fl), Scale(fr));
                     else if (drive == 1) driven = std::max(Scale(rl), Scale(rr));
@@ -192,7 +318,19 @@ static DWORD WINAPI TelemetryThread(LPVOID) {
                     if (brake > 0.2) left  = lock * brake * Pulse();
                 }
             }
+        } else if (g_cfg.inputEnabled && GetTickCount64() - g_lastTelemetry > 1000) {
+            // No telemetry: generic effect from trigger pull only
+            if (!loggedInput) { Log("no telemetry, using input-only mode"); loggedInput = true; }
+            double t = g_throttle / 255.0, b = g_brake / 255.0;
+            ULONGLONG now = GetTickCount64();
+            if (t - prevT > g_cfg.burstThreshold) burstUntil = now + (ULONGLONG)g_cfg.burstMs;
+            prevT = t;
+            if (now < burstUntil)  right = g_cfg.burstStrength;
+            else if (t > 0.1)      right = g_cfg.humBase + g_cfg.humScale * t;
+            if (b > g_cfg.chatterThreshold) left = g_cfg.chatterStrength * Pulse();
+            else if (b > 0.1)      left = g_cfg.lightBrake * b;
         }
+        if (!g_cfg.enabled) { left = 0.0; right = 0.0; }
         ApplyTriggers(left, right);
     }
     return 0;
@@ -205,6 +343,14 @@ static BOOL CALLBACK StartThread(PINIT_ONCE, PVOID, PVOID*) {
     return TRUE;
 }
 
+static DWORD Capture(DWORD r, DWORD i, XINPUT_STATE* s) {
+    if (r == ERROR_SUCCESS && s && i == 0) {
+        g_throttle = s->Gamepad.bRightTrigger;
+        g_brake = s->Gamepad.bLeftTrigger;
+    }
+    return r;
+}
+
 // ---- Exported (proxy) functions ----
 extern "C" {
 
@@ -212,15 +358,15 @@ DWORD WINAPI Proxy_XInputGetState(DWORD i, XINPUT_STATE* s) {
     EnsureReal();
     LOG_FIRST();
     InitOnceExecuteOnce(&g_threadOnce, StartThread, nullptr, nullptr); // not in DllMain: loader lock
-    return r_GetState ? r_GetState(i, s) : ERROR_DEVICE_NOT_CONNECTED;
+    return Capture(r_GetState ? r_GetState(i, s) : ERROR_DEVICE_NOT_CONNECTED, i, s);
 }
 
 DWORD WINAPI Proxy_XInputGetStateEx(DWORD i, XINPUT_STATE* s) {
     EnsureReal();
     LOG_FIRST();
     InitOnceExecuteOnce(&g_threadOnce, StartThread, nullptr, nullptr);
-    if (r_GetStateEx) return r_GetStateEx(i, s);
-    return r_GetState ? r_GetState(i, s) : ERROR_DEVICE_NOT_CONNECTED;
+    if (r_GetStateEx) return Capture(r_GetStateEx(i, s), i, s);
+    return Capture(r_GetState ? r_GetState(i, s) : ERROR_DEVICE_NOT_CONNECTED, i, s);
 }
 
 DWORD WINAPI Proxy_XInputSetState(DWORD i, XINPUT_VIBRATION* v) {
@@ -278,13 +424,16 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID) {
                 *(slash + 1) = 0;
                 wcscat_s(path, L"fh4_trigger_proxy.log");
                 wcscpy_s(g_logPath, path);
+                wcscpy_s(g_iniPath, path);
+                wchar_t* dot = wcsrchr(g_iniPath, L'\\');
+                if (dot) { *(dot + 1) = 0; wcscat_s(g_iniPath, L"fh4_trigger.ini"); }
             }
         }
         wchar_t exe[MAX_PATH];
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         char exeA[MAX_PATH];
         WideCharToMultiByte(CP_UTF8, 0, exe, -1, exeA, MAX_PATH, nullptr, nullptr);
-        Log("=== BUILD v5 (in-process telemetry triggers) === attached to: %s", exeA);
+        Log("=== BUILD v7 (config file) === attached to: %s", exeA);
     }
     return TRUE;
 }
