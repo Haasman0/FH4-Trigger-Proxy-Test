@@ -10,11 +10,12 @@ jobs:
     strategy:
       matrix:
         name: [xinput1_4, xinput1_3, xinput9_1_0]
+        variant: [full, lite]
     steps:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: cmake -B build -A x64 -DPROXY_NAME=${{ matrix.name }}
+        run: cmake -B build -A x64 -DPROXY_NAME=${{ matrix.name }} -DFH4_VARIANT=${{ matrix.variant }}
 
       - name: Build
         run: cmake --build build --config Release
@@ -22,5 +23,5 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
+          name: ${{ matrix.name }}-${{ matrix.variant }}
           path: build/Release/${{ matrix.name }}.dll
