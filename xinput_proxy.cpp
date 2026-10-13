@@ -50,6 +50,8 @@ struct Config {
     double burstStrength = 0.7;
     double burstThreshold = 0.25;     // throttle jump (0..1) that triggers the kick
     int    burstMs = 150;
+    int    autoTestSeconds = 25;      // run the self-test once this long after start (0 = off)
+    bool   debugInput = true;         // log button/trigger changes
     int    burstWindowMs = 120;       // the throttle jump must happen within this time
     double chatterThreshold = 0.85;   // brake pull (0..1) where chatter starts
     double chatterStrength = 0.55;
@@ -138,6 +140,7 @@ static INIT_ONCE   g_threadOnce = INIT_ONCE_STATIC_INIT;
 static volatile LONG      g_throttle = 0;       // latest right trigger 0..255 seen via XInputGetState
 static volatile LONG      g_brake = 0;          // latest left trigger 0..255
 static volatile ULONGLONG g_lastTelemetry = 0;  // tick of last telemetry packet
+static volatile LONG      g_buttons = 0;        // latest button bitmask seen via XInputGetState
 static volatile LONG      g_testRequested = 0;  // set when LB + RB + View are held together
 
 static BOOL CALLBACK InitReal(PINIT_ONCE, PVOID, PVOID*) {
@@ -206,7 +209,12 @@ static const char* DEFAULT_INI =
 "burst_window_ms=120  ; the throttle jump must happen within this time\r\n"
 "chatter_threshold=0.85 ; brake pull where chatter starts\r\n"
 "chatter_strength=0.55\r\n"
-"light_brake=0.15     ; faint buzz at lighter braking\r\n";
+"light_brake=0.15     ; faint buzz at lighter braking\r\n"
+"\r\n"
+"; Debugging\r\n"
+"[Debug]\r\n"
+"auto_test_seconds=25 ; run the trigger self-test once this many seconds after the game starts (0 = off)\r\n"
+"log_input=1          ; log button and trigger changes to the log (first 200 only)\r\n";
 
 static double CfgD(const wchar_t* sec, const wchar_t* key, double def, double lo, double hi) {
     wchar_t dflt[64], buf[64];
@@ -240,6 +248,8 @@ static void LoadConfig(bool first) {
     g_cfg.burstStrength  = CfgD(L"InputOnly", L"burst_strength", 0.7, 0, 1);
     g_cfg.burstThreshold = CfgD(L"InputOnly", L"burst_threshold", 0.25, 0.01, 1);
     g_cfg.burstMs        = (int)CfgD(L"InputOnly", L"burst_ms", 150, 10, 2000);
+    g_cfg.autoTestSeconds = (int)CfgD(L"Debug", L"auto_test_seconds", 25, 0, 3600);
+    g_cfg.debugInput     = CfgB(L"Debug", L"log_input", true);
     g_cfg.burstWindowMs  = (int)CfgD(L"InputOnly", L"burst_window_ms", 120, 20, 1000);
     g_cfg.chatterThreshold = CfgD(L"InputOnly", L"chatter_threshold", 0.85, 0, 1);
     g_cfg.chatterStrength  = CfgD(L"InputOnly", L"chatter_strength", 0.55, 0, 1);
@@ -303,6 +313,13 @@ static void LogReadback(const char* tag) {
     } catch (...) { Log("%s readback failed", tag); }
 }
 
+static void PollPadCount(unsigned& last) {
+    try {
+        unsigned cnt = (unsigned)Gamepad::Gamepads().Size();
+        if (cnt != last) { Log("gamepads visible to Windows.Gaming.Input changed: %u -> %u", last == 0xFFFFFFFFu ? 0u : last, cnt); last = cnt; }
+    } catch (...) {}
+}
+
 static DWORD WINAPI TelemetryThread(LPVOID) {
     try { winrt::init_apartment(winrt::apartment_type::multi_threaded); } catch (...) {}
 
@@ -335,6 +352,12 @@ static DWORD WINAPI TelemetryThread(LPVOID) {
     double prevT = 0.0;
     ULONGLONG windowTick = 0;
     ULONGLONG testStart = 0;
+    ULONGLONG autoTestAt = 0;
+    bool autoTestDone = false;
+    unsigned lastPollCount = 0xFFFFFFFFu;
+    long lastBtn = -1, lastTB = -1, lastBB = -1;
+    ULONGLONG lastInputLog = 0;
+    int inputLogCount = 0;
     int lastPhase = -1;
     bool loggedInputFx = false;
     ULONGLONG burstUntil = 0;
@@ -345,14 +368,34 @@ static DWORD WINAPI TelemetryThread(LPVOID) {
         if (GetTickCount64() >= nextCfgCheck) {
             nextCfgCheck = GetTickCount64() + 1000;
             if (IniChanged()) LoadConfig(false);
+            PollPadCount(lastPollCount);
         }
         double left = 0.0, right = 0.0;
+
+        // Automatic self-test shortly after start, so it doesn't depend on button input
+        if (!autoTestDone && g_cfg.autoTestSeconds > 0) {
+            if (autoTestAt == 0) autoTestAt = GetTickCount64() + (ULONGLONG)g_cfg.autoTestSeconds * 1000;
+            else if (GetTickCount64() >= autoTestAt) {
+                autoTestDone = true;
+                InterlockedExchange(&g_testRequested, 1);
+                Log("automatic self-test due (auto_test_seconds=%d)", g_cfg.autoTestSeconds);
+            }
+        }
+        // Log what the DLL actually sees from the controller
+        if (g_cfg.debugInput && inputLogCount < 200) {
+            long btn = g_buttons, tb = g_throttle / 64, bb = g_brake / 64;
+            ULONGLONG t2 = GetTickCount64();
+            if ((btn != lastBtn || tb != lastTB || bb != lastBB) && t2 - lastInputLog >= 250) {
+                lastBtn = btn; lastTB = tb; lastBB = bb; lastInputLog = t2; inputLogCount++;
+                Log("input: buttons=0x%04lX throttle=%ld brake=%ld", btn, (long)g_throttle, (long)g_brake);
+            }
+        }
 
         // Self-test (hold LB + RB + View): 1 s left trigger, 1 s right trigger, 1 s main motors
         ULONGLONG tnow = GetTickCount64();
         if (!testStart && InterlockedExchange(&g_testRequested, 0)) {
             testStart = tnow; lastPhase = -1;
-            Log("trigger self-test started: left trigger, then right trigger, then main motors");
+            Log("trigger self-test started (combo or auto): left trigger, right trigger, main motors");
         }
         if (testStart) {
             ULONGLONG el = tnow - testStart;
@@ -439,6 +482,7 @@ static DWORD Capture(DWORD r, DWORD i, XINPUT_STATE* s) {
         if ((LONG)i == g_activeSlot) {
             g_throttle = s->Gamepad.bRightTrigger;
             g_brake = s->Gamepad.bLeftTrigger;
+            g_buttons = s->Gamepad.wButtons;
             const WORD combo = XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER | XINPUT_GAMEPAD_BACK;
             if ((s->Gamepad.wButtons & combo) == combo) InterlockedExchange(&g_testRequested, 1);
         }
@@ -529,7 +573,7 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID) {
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         char exeA[MAX_PATH];
         WideCharToMultiByte(CP_UTF8, 0, exe, -1, exeA, MAX_PATH, nullptr, nullptr);
-        Log("=== BUILD v13 (self-test + all gamepads) === attached to: %s", exeA);
+        Log("=== BUILD v14 (auto self-test + input debug) === attached to: %s", exeA);
     }
     return TRUE;
 }
