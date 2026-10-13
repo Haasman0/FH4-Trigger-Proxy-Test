@@ -61,6 +61,8 @@ static void Log(const char* fmt, ...) {
     CloseHandle(h);
 }
 
+#define LOG_FIRST() do { static LONG c_ = 0; if (InterlockedIncrement(&c_) == 1) Log("first call: %s", __func__); } while (0)
+
 static BOOL CALLBACK InitReal(PINIT_ONCE, PVOID, PVOID*) {
     wchar_t path[MAX_PATH];
     GetSystemDirectoryW(path, MAX_PATH);
@@ -108,17 +110,20 @@ extern "C" {
 
 DWORD WINAPI Proxy_XInputGetState(DWORD i, XINPUT_STATE* s) {
     EnsureReal();
+    LOG_FIRST();
     return r_GetState ? r_GetState(i, s) : ERROR_DEVICE_NOT_CONNECTED;
 }
 
 DWORD WINAPI Proxy_XInputGetStateEx(DWORD i, XINPUT_STATE* s) {
     EnsureReal();
+    LOG_FIRST();
     if (r_GetStateEx) return r_GetStateEx(i, s);
     return r_GetState ? r_GetState(i, s) : ERROR_DEVICE_NOT_CONNECTED;
 }
 
 DWORD WINAPI Proxy_XInputSetState(DWORD i, XINPUT_VIBRATION* v) {
     EnsureReal();
+    LOG_FIRST();
     DWORD res = r_SetState ? r_SetState(i, v) : ERROR_DEVICE_NOT_CONNECTED;
     if (v) {
         static int n = 0;
@@ -130,26 +135,31 @@ DWORD WINAPI Proxy_XInputSetState(DWORD i, XINPUT_VIBRATION* v) {
 
 DWORD WINAPI Proxy_XInputGetCapabilities(DWORD i, DWORD f, XINPUT_CAPABILITIES* c) {
     EnsureReal();
+    LOG_FIRST();
     return r_GetCaps ? r_GetCaps(i, f, c) : ERROR_DEVICE_NOT_CONNECTED;
 }
 
 void WINAPI Proxy_XInputEnable(BOOL e) {
     EnsureReal();
+    LOG_FIRST();
     if (r_Enable) r_Enable(e);
 }
 
 DWORD WINAPI Proxy_XInputGetBatteryInformation(DWORD i, BYTE t, XINPUT_BATTERY_INFORMATION* b) {
     EnsureReal();
+    LOG_FIRST();
     return r_Battery ? r_Battery(i, t, b) : ERROR_DEVICE_NOT_CONNECTED;
 }
 
 DWORD WINAPI Proxy_XInputGetKeystroke(DWORD i, DWORD r, PXINPUT_KEYSTROKE k) {
     EnsureReal();
+    LOG_FIRST();
     return r_Keystroke ? r_Keystroke(i, r, k) : ERROR_DEVICE_NOT_CONNECTED;
 }
 
 DWORD WINAPI Proxy_XInputGetAudioDeviceIds(DWORD i, LPWSTR a, UINT* ac, LPWSTR b, UINT* bc) {
     EnsureReal();
+    LOG_FIRST();
     return r_AudioIds ? r_AudioIds(i, a, ac, b, bc) : ERROR_DEVICE_NOT_CONNECTED;
 }
 
