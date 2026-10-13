@@ -62,4 +62,4 @@ set_target_properties(proxy PROPERTIES
     OUTPUT_NAME "${PROXY_NAME}")
 
 target_compile_definitions(proxy PRIVATE _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
-target_link_libraries(proxy PRIVATE windowsapp user32)
+target_link_libraries(proxy PRIVATE windowsapp user32 ws2_32)
