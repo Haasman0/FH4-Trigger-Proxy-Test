@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cwchar>
 #include <cstdlib>
+#include <cstring>
 #include <algorithm>
 
 using namespace winrt::Windows::Gaming::Input;
@@ -32,6 +33,7 @@ using namespace winrt::Windows::Gaming::Input;
 struct Config {
     bool   log = true;
     bool   enabled = true;
+    bool   disableScreenReader = true; // report 'no screen reader running' to the game
     int    port = 5300;               // restart needed to change
     // Telemetry mode
     double slipStart = 0.35;          // slip ratio where the effect begins
@@ -174,7 +176,11 @@ static const char* DEFAULT_INI =
 "burst_ms=150         ; kick length in milliseconds\r\n"
 "chatter_threshold=0.85 ; brake pull where chatter starts\r\n"
 "chatter_strength=0.55\r\n"
-"light_brake=0.10     ; faint buzz at lighter braking\r\n";
+"light_brake=0.10     ; faint buzz at lighter braking\r\n"
+"\r\n"
+"; Tells the game no screen reader is running (stops menu narration if the game asks Windows)\r\n"
+"[Accessibility]\r\n"
+"disable_screen_reader=1\r\n";
 
 static double CfgD(const wchar_t* sec, const wchar_t* key, double def, double lo, double hi) {
     wchar_t dflt[64], buf[64];
@@ -191,6 +197,7 @@ static bool CfgB(const wchar_t* sec, const wchar_t* key, bool def) {
 static void LoadConfig(bool first) {
     g_cfg.enabled        = CfgB(L"General", L"enabled", true);
     g_cfg.log            = CfgB(L"General", L"log", true);
+    g_cfg.disableScreenReader = CfgB(L"Accessibility", L"disable_screen_reader", true);
     if (first) g_cfg.port = (int)CfgD(L"General", L"udp_port", 5300, 1, 65535);
 
     g_cfg.slipStart      = CfgD(L"Telemetry", L"slip_start", 0.35, 0, 10);
@@ -336,11 +343,75 @@ static DWORD WINAPI TelemetryThread(LPVOID) {
     return 0;
 }
 
+static void InstallScreenReaderPatch();   // defined below
+
 static BOOL CALLBACK StartThread(PINIT_ONCE, PVOID, PVOID*) {
+    InstallScreenReaderPatch();
     HANDLE h = CreateThread(nullptr, 0, TelemetryThread, nullptr, 0, nullptr);
     if (h) { CloseHandle(h); Log("telemetry thread started"); }
     else   { Log("CreateThread failed"); }
     return TRUE;
+}
+
+// ---- Screen reader patch (in-memory only; no game files are modified) ----
+// Many games ask Windows "is a screen reader running?" via SystemParametersInfo(SPI_GETSCREENREADER)
+// and enable menu narration if the answer is yes. We patch the game's import of that function
+// so the answer is "no" when disable_screen_reader=1.
+typedef BOOL(WINAPI* SPIW_t)(UINT, UINT, PVOID, UINT);
+typedef BOOL(WINAPI* SPIA_t)(UINT, UINT, PVOID, UINT);
+static SPIW_t real_SPIW = nullptr;
+static SPIA_t real_SPIA = nullptr;
+
+static void ScreenReaderFixup(UINT action, PVOID out, BOOL ok, const char* which) {
+    if (action != SPI_GETSCREENREADER || !out || !ok) return;
+    static LONG logged = 0;
+    if (InterlockedExchange(&logged, 1) == 0)
+        Log("game queried SPI_GETSCREENREADER via %s (Windows said %d, override %s)",
+            which, *(BOOL*)out ? 1 : 0, g_cfg.disableScreenReader ? "on" : "off");
+    if (g_cfg.disableScreenReader) *(BOOL*)out = FALSE;
+}
+static BOOL WINAPI Hook_SPIW(UINT a, UINT b, PVOID c, UINT d) {
+    BOOL r = real_SPIW(a, b, c, d);
+    ScreenReaderFixup(a, c, r, "SystemParametersInfoW");
+    return r;
+}
+static BOOL WINAPI Hook_SPIA(UINT a, UINT b, PVOID c, UINT d) {
+    BOOL r = real_SPIA(a, b, c, d);
+    ScreenReaderFixup(a, c, r, "SystemParametersInfoA");
+    return r;
+}
+
+static bool PatchImport(HMODULE mod, const char* dll, const char* func, void* hook, void** origOut) {
+    BYTE* base = (BYTE*)mod;
+    auto dos = (IMAGE_DOS_HEADER*)base;
+    auto nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return false;
+    for (auto imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + dir.VirtualAddress); imp->Name; ++imp) {
+        if (_stricmp((const char*)(base + imp->Name), dll) != 0) continue;
+        auto thunk = (IMAGE_THUNK_DATA*)(base + imp->FirstThunk);
+        auto look  = (IMAGE_THUNK_DATA*)(base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
+        for (; look->u1.AddressOfData; ++look, ++thunk) {
+            if (IMAGE_SNAP_BY_ORDINAL(look->u1.Ordinal)) continue;
+            auto byName = (IMAGE_IMPORT_BY_NAME*)(base + look->u1.AddressOfData);
+            if (strcmp((const char*)byName->Name, func) != 0) continue;
+            DWORD old;
+            if (!VirtualProtect(&thunk->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) return false;
+            *origOut = (void*)thunk->u1.Function;
+            thunk->u1.Function = (ULONG_PTR)hook;
+            VirtualProtect(&thunk->u1.Function, sizeof(void*), old, &old);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void InstallScreenReaderPatch() {
+    HMODULE exe = GetModuleHandleW(nullptr);
+    bool w = PatchImport(exe, "user32.dll", "SystemParametersInfoW", (void*)Hook_SPIW, (void**)&real_SPIW);
+    bool a = PatchImport(exe, "user32.dll", "SystemParametersInfoA", (void*)Hook_SPIA, (void**)&real_SPIA);
+    Log("screen reader patch: SystemParametersInfoW %s, SystemParametersInfoA %s",
+        w ? "hooked" : "not imported by exe", a ? "hooked" : "not imported by exe");
 }
 
 static DWORD Capture(DWORD r, DWORD i, XINPUT_STATE* s) {
@@ -433,7 +504,7 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID) {
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         char exeA[MAX_PATH];
         WideCharToMultiByte(CP_UTF8, 0, exe, -1, exeA, MAX_PATH, nullptr, nullptr);
-        Log("=== BUILD v7 (config file) === attached to: %s", exeA);
+        Log("=== BUILD v8 (screen reader patch) === attached to: %s", exeA);
     }
     return TRUE;
 }
