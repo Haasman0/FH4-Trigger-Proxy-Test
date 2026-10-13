@@ -138,6 +138,7 @@ static INIT_ONCE   g_threadOnce = INIT_ONCE_STATIC_INIT;
 static volatile LONG      g_throttle = 0;       // latest right trigger 0..255 seen via XInputGetState
 static volatile LONG      g_brake = 0;          // latest left trigger 0..255
 static volatile ULONGLONG g_lastTelemetry = 0;  // tick of last telemetry packet
+static volatile LONG      g_testRequested = 0;  // set when LB + RB + View are held together
 
 static BOOL CALLBACK InitReal(PINIT_ONCE, PVOID, PVOID*) {
     wchar_t path[MAX_PATH];
@@ -262,31 +263,44 @@ static bool IniChanged() {
     return true;
 }
 
-static void ApplyTriggers(double left, double right) {
-    static Gamepad pad{ nullptr };
-    static double lastL = -1, lastR = -1;
+// Writes trigger strengths to every gamepad Windows.Gaming.Input can see (the Ally X may expose
+// more than one). motors >= 0 also drives both main motors (used by the self-test); -1 leaves them alone.
+static void ApplyTriggers(double left, double right, double motors = -1.0) {
+    static double lastL = -1, lastR = -1, lastM = -1;
     static bool loggedOk = false, loggedFail = false;
+    static unsigned lastCount = 0xFFFFFFFFu;
 
-    if (left == 0.0 && right == 0.0 && lastL == 0.0 && lastR == 0.0) return; // nothing to change
+    if (left == 0.0 && right == 0.0 && motors < 0.0 && lastL == 0.0 && lastR == 0.0 && lastM < 0.0) return;
 
     try {
-        if (!pad) {
-            auto pads = Gamepad::Gamepads();
-            if (pads.Size() == 0) return;
-            pad = pads.GetAt(0);
-            Log("gamepad found via Windows.Gaming.Input");
+        auto pads = Gamepad::Gamepads();
+        unsigned cnt = (unsigned)pads.Size();
+        if (cnt != lastCount) { Log("gamepads visible to Windows.Gaming.Input: %u", cnt); lastCount = cnt; }
+        for (auto const& pad : pads) {
+            GamepadVibration v{};
+            try { v = pad.Vibration(); } catch (...) {}    // keep any main-motor values
+            v.LeftTrigger  = std::min(g_cfg.maxStrength, left * g_cfg.leftGain);
+            v.RightTrigger = std::min(g_cfg.maxStrength, right * g_cfg.rightGain);
+            if (motors >= 0.0) { v.LeftMotor = motors; v.RightMotor = motors; }
+            pad.Vibration(v);
         }
-        GamepadVibration v{};
-        try { v = pad.Vibration(); } catch (...) {}   // keep any main-motor values
-        v.LeftTrigger  = std::min(g_cfg.maxStrength, left * g_cfg.leftGain);
-        v.RightTrigger = std::min(g_cfg.maxStrength, right * g_cfg.rightGain);
-        pad.Vibration(v);
-        lastL = left; lastR = right;
-        if (!loggedOk && (left > 0 || right > 0)) { Log("trigger write OK"); loggedOk = true; }
+        lastL = left; lastR = right; lastM = motors;
+        if (!loggedOk && (left > 0 || right > 0)) { Log("trigger write accepted by Windows (no error)"); loggedOk = true; }
     } catch (...) {
         if (!loggedFail) { Log("trigger write FAILED"); loggedFail = true; }
-        pad = nullptr;
     }
+}
+
+static void LogReadback(const char* tag) {
+    try {
+        auto pads = Gamepad::Gamepads();
+        unsigned idx = 0;
+        for (auto const& pad : pads) {
+            auto v = pad.Vibration();
+            Log("%s readback pad %u: LT=%.2f RT=%.2f LM=%.2f RM=%.2f", tag, idx++,
+                v.LeftTrigger, v.RightTrigger, v.LeftMotor, v.RightMotor);
+        }
+    } catch (...) { Log("%s readback failed", tag); }
 }
 
 static DWORD WINAPI TelemetryThread(LPVOID) {
@@ -314,11 +328,14 @@ static DWORD WINAPI TelemetryThread(LPVOID) {
     DWORD timeoutMs = 16;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
     Log("telemetry listening on 127.0.0.1:%d", g_cfg.port);
+    Log("tip: hold LB + RB + View together to run a trigger self-test");
 
     bool loggedFirst = false;
     char buf[1024];
     double prevT = 0.0;
     ULONGLONG windowTick = 0;
+    ULONGLONG testStart = 0;
+    int lastPhase = -1;
     bool loggedInputFx = false;
     ULONGLONG burstUntil = 0;
     bool loggedInput = false;
@@ -330,6 +347,32 @@ static DWORD WINAPI TelemetryThread(LPVOID) {
             if (IniChanged()) LoadConfig(false);
         }
         double left = 0.0, right = 0.0;
+
+        // Self-test (hold LB + RB + View): 1 s left trigger, 1 s right trigger, 1 s main motors
+        ULONGLONG tnow = GetTickCount64();
+        if (!testStart && InterlockedExchange(&g_testRequested, 0)) {
+            testStart = tnow; lastPhase = -1;
+            Log("trigger self-test started: left trigger, then right trigger, then main motors");
+        }
+        if (testStart) {
+            ULONGLONG el = tnow - testStart;
+            int phase = el < 1000 ? 0 : el < 2000 ? 1 : el < 3000 ? 2 : 3;
+            if (phase == 3) {
+                ApplyTriggers(0.0, 0.0, 0.0);
+                testStart = 0;
+                Log("trigger self-test finished");
+                continue;
+            }
+            double tl = (phase == 0) ? 1.0 : 0.0, tr = (phase == 1) ? 1.0 : 0.0, tm = (phase == 2) ? 0.6 : -1.0;
+            ApplyTriggers(tl, tr, tm);
+            if (phase != lastPhase) {
+                static const char* names[] = { "left trigger", "right trigger", "main motors" };
+                Log("self-test phase: %s", names[phase]);
+                LogReadback(names[phase]);
+                lastPhase = phase;
+            }
+            continue;
+        }
 
         if (n >= MIN_LEN) {
             g_lastTelemetry = GetTickCount64();
@@ -396,6 +439,8 @@ static DWORD Capture(DWORD r, DWORD i, XINPUT_STATE* s) {
         if ((LONG)i == g_activeSlot) {
             g_throttle = s->Gamepad.bRightTrigger;
             g_brake = s->Gamepad.bLeftTrigger;
+            const WORD combo = XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER | XINPUT_GAMEPAD_BACK;
+            if ((s->Gamepad.wButtons & combo) == combo) InterlockedExchange(&g_testRequested, 1);
         }
     }
     return r;
@@ -484,7 +529,7 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID) {
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         char exeA[MAX_PATH];
         WideCharToMultiByte(CP_UTF8, 0, exe, -1, exeA, MAX_PATH, nullptr, nullptr);
-        Log("=== BUILD v12 (input-only fixes) === attached to: %s", exeA);
+        Log("=== BUILD v13 (self-test + all gamepads) === attached to: %s", exeA);
     }
     return TRUE;
 }
