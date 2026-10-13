@@ -192,7 +192,7 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID) {
         GetModuleFileNameW(nullptr, exe, MAX_PATH);
         char exeA[MAX_PATH];
         WideCharToMultiByte(CP_UTF8, 0, exe, -1, exeA, MAX_PATH, nullptr, nullptr);
-        Log("DLL attached to process: %s", exeA);
+        Log("=== BUILD v4 (first-call logging) === attached to: %s", exeA);
     }
     return TRUE;
 }
